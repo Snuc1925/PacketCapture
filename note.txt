@@ -1,0 +1,17 @@
+mkdir build
+cd build
+cmake ..
+cmake --build .
+
+Đề tài 4: Xây dựng công cụ Packet capture and stream
+1. Mô tả
+Xây dựng công cụ thu thập traffic mạng từ card mạng của các máy trạm, máy chủ, …  sau đó gửi về hệ thống xử lý tập trung, phục vụ cho các hệ thống giám sát ATTT.
+2. Yêu cầu chức năng
+• Packet capture agent là một service chạy trên máy trạm, máy chủ … thực hiện thu thập traffic mạng từ các card mạng, áp dụng một số bộ lọc, sau đó thực hiện truyền traffic mạng đó về một bộ thu trung tâm.
+• Packet receiver center nhận traffic từ nhiều Packet capture agent lưu dưới dạng file pcap, hoặc tích hợp với các công cụ khác như Zeek, Suricata để phân tích live traffic
+• Luồng gửi traffic có thể được nén hoặc mã hóa TLS.
+• Có thể cấu hình interface muốn thu thập traffic, cấu hình filter traffic mong muốn
+3. Yêu cầu phi chức năng
+• Có thể hoạt động trên Linux (Ubuntu), Windows (Optional)
+• Packet capture agent có thể xử lý lưu lượng mạng ~ 500 Mbps
+• Project có áp dụng các kiến thức về đóng gói phần mềm, lập trình ATTT, có unit test.
