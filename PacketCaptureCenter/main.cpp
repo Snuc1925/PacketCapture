@@ -39,6 +39,7 @@ struct ClientState {
     uint16_t port;
     std::vector<PacketInfo> buffered_packets;
     size_t current_total_bytes;
+    long long current_total_packets;
 
     std::vector<char> recv_buffer;
 
@@ -59,6 +60,7 @@ struct ClientState {
 
 
     ClientState() : 
+        current_total_packets(0),
         current_total_bytes(0), 
         current_fsm_state(ReceiveFSM::AWAITING_METADATA_LINKTYPE),
         datalink_type(DLT_NULL) // Giá trị mặc định an toàn
@@ -83,7 +85,7 @@ void save_packets_to_pcap(ClientState& client) {
     }
 
     std::string filename = generate_pcap_filename(client.ip_address, client.port);
-    std::cout << "Server: Saving " << client.current_total_bytes << " bytes for client "
+    std::cout << "Server: Saving " << client.current_total_bytes << " bytes, " << client.current_total_packets << " packets for client "
               << client.ip_address << ":" << client.port 
               << " (Datalink: " << client.datalink_type << " - " << pcap_datalink_val_to_name(client.datalink_type) << ") to " << filename << std::endl;
 
@@ -116,6 +118,7 @@ void save_packets_to_pcap(ClientState& client) {
 
     client.buffered_packets.clear();
     client.current_total_bytes = 0;
+    client.current_total_packets = 0;
 }
 
 
@@ -327,6 +330,7 @@ int main() { // Server main
                                         
                                         current_client.buffered_packets.push_back(pkt);
                                         current_client.current_total_bytes += current_client.expected_pcap_caplen;
+                                        current_client.current_total_packets++;
                                         
                                         current_client.recv_buffer.erase(current_client.recv_buffer.begin(),
                                                                          current_client.recv_buffer.begin() + current_client.expected_pcap_caplen);
