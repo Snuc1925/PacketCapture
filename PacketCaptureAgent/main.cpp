@@ -13,12 +13,19 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <memory> // For std::unique_ptr
+
+// System headers
 #include <pcap.h>
 #include <cstring>
 #include <unistd.h>
 #include <cerrno>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+
+// OpenSSL headers (cần cho TLS)
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 // --- Cấu trúc để chứa toàn bộ cấu hình ---
 struct AppConfig {
@@ -29,8 +36,10 @@ struct AppConfig {
     int batch_packet_count = 256;
     size_t max_queue_blocks = 1024;
     int send_buffer_size_kb = 4096;
+    bool encrypt = false; // Thêm cấu hình mã hóa
 };
 
+// ... Các phần khác như BoundedThreadSafeQueue, CapturedPacket giữ nguyên ...
 // --- Biến toàn cục ---
 std::atomic<bool> capture_interrupted(false);
 std::atomic<long long> total_bytes_sent(0);
@@ -97,23 +106,189 @@ public:
     }
 };
 
-// --- Hàm tiện ích ---
-bool send_all_data(int sockfd, const void* buffer, size_t length) {
-    const char* ptr = static_cast<const char*>(buffer);
-    while (length > 0) {
-        ssize_t sent = send(sockfd, ptr, length, MSG_NOSIGNAL);
-        if (sent <= 0) {
-            if (sent < 0 && errno == EINTR) continue;
-            std::cerr << "send_all_data error: " << strerror(errno) << std::endl;
+
+// =================================================================
+// BƯỚC 1: ĐỊNH NGHĨA INTERFACE CHO KẾT NỐI (STRATEGY PATTERN)
+// =================================================================
+class IConnection {
+public:
+    virtual ~IConnection() = default; // Destructor ảo là BẮT BUỘC
+    virtual bool connect(const std::string& ip, int port) = 0;
+    virtual bool send_data(const void* buffer, size_t length) = 0;
+    virtual void disconnect() = 0;
+};
+
+
+// =================================================================
+// BƯỚC 2: TRIỂN KHAI CÁC LỚP KẾT NỐI CỤ THỂ
+// =================================================================
+
+// --- Lớp cho kết nối TCP thông thường (không mã hóa) ---
+class PlainTcpConnection : public IConnection {
+private:
+    int sockfd_ = -1;
+
+public:
+    ~PlainTcpConnection() override {
+        disconnect();
+    }
+
+    bool connect(const std::string& ip, int port) override {
+        sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd_ < 0) {
+            perror("Socket creation failed");
             return false;
         }
-        ptr += sent;
-        length -= sent;
+
+        struct sockaddr_in serv_addr;
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(port);
+        if (inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0) {
+            perror("Invalid address/ Address not supported");
+            return false;
+        }
+
+        if (::connect(sockfd_, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+            perror("Connect failed");
+            close(sockfd_);
+            sockfd_ = -1;
+            return false;
+        }
+        std::cout << "Connection strategy: Plain TCP" << std::endl;
+        return true;
     }
-    return true;
+
+    bool send_data(const void* buffer, size_t length) override {
+        if (sockfd_ < 0) return false;
+        const char* ptr = static_cast<const char*>(buffer);
+        while (length > 0) {
+            ssize_t sent = send(sockfd_, ptr, length, MSG_NOSIGNAL);
+            if (sent <= 0) {
+                if (sent < 0 && errno == EINTR) continue;
+                std::cerr << "send_data error: " << strerror(errno) << std::endl;
+                return false;
+            }
+            ptr += sent;
+            length -= sent;
+        }
+        return true;
+    }
+
+    void disconnect() override {
+        if (sockfd_ != -1) {
+            close(sockfd_);
+            sockfd_ = -1;
+        }
+    }
+};
+
+// --- Lớp cho kết nối TLS (mã hóa) sử dụng OpenSSL ---
+class TlsConnection : public IConnection {
+private:
+    int sockfd_ = -1;
+    SSL_CTX* ctx_ = nullptr;
+    SSL* ssl_ = nullptr;
+
+    void init_openssl() {
+        SSL_load_error_strings();
+        OpenSSL_add_ssl_algorithms();
+    }
+
+    void cleanup_openssl() {
+        EVP_cleanup();
+    }
+
+    SSL_CTX* create_context() {
+        const SSL_METHOD *method = TLS_client_method();
+        SSL_CTX *ctx = SSL_CTX_new(method);
+        if (!ctx) {
+            perror("Unable to create SSL context");
+            ERR_print_errors_fp(stderr);
+            exit(EXIT_FAILURE);
+        }
+        return ctx;
+    }
+
+public:
+    TlsConnection() {
+        init_openssl();
+        ctx_ = create_context();
+    }
+
+    ~TlsConnection() override {
+        disconnect();
+        if (ctx_) {
+            SSL_CTX_free(ctx_);
+        }
+        cleanup_openssl();
+    }
+
+    bool connect(const std::string& ip, int port) override {
+        sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd_ < 0) { /* ... error handling ... */ return false; }
+        
+        struct sockaddr_in serv_addr;
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(port);
+        inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr);
+
+        if (::connect(sockfd_, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+            perror("TCP connect failed for TLS");
+            return false;
+        }
+
+        ssl_ = SSL_new(ctx_);
+        SSL_set_fd(ssl_, sockfd_);
+
+        if (SSL_connect(ssl_) <= 0) {
+            ERR_print_errors_fp(stderr);
+            return false;
+        }
+        std::cout << "Connection strategy: TLS (OpenSSL)" << std::endl;
+        return true;
+    }
+
+    bool send_data(const void* buffer, size_t length) override {
+        if (!ssl_) return false;
+        
+        int bytes_sent = SSL_write(ssl_, buffer, length);
+        if (bytes_sent <= 0) {
+            int err = SSL_get_error(ssl_, bytes_sent);
+            std::cerr << "SSL_write failed with error code: " << err << std::endl;
+            ERR_print_errors_fp(stderr);
+            return false;
+        }
+        return true;
+    }
+
+    void disconnect() override {
+        if (ssl_) {
+            SSL_shutdown(ssl_);
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+        }
+        if (sockfd_ != -1) {
+            close(sockfd_);
+            sockfd_ = -1;
+        }
+    }
+};
+
+// =================================================================
+// BƯỚC 3: TẠO FACTORY ĐỂ CHỌN CHIẾN LƯỢC
+// =================================================================
+std::unique_ptr<IConnection> create_connection(const AppConfig& config) {
+    if (config.encrypt) {
+        std::cout << "TLS Connection!!!" << std::endl;
+        return std::make_unique<TlsConnection>();
+    } else {
+        return std::make_unique<PlainTcpConnection>();
+        std::cout << "PlainTCP Connection!!!" << std::endl;
+    }
 }
 
-// Hàm trim để xóa khoảng trắng thừa
+// --- Hàm đọc cấu hình mới ---
+// Hàm trim
 std::string trim(const std::string& s) {
     size_t first = s.find_first_not_of(" \t\n\r");
     if (std::string::npos == first) return s;
@@ -121,7 +296,6 @@ std::string trim(const std::string& s) {
     return s.substr(first, (last - first + 1));
 }
 
-// Hàm đọc cấu hình mới
 bool parse_config(const std::string& filename, AppConfig& config) {
     std::ifstream config_file(filename);
     if (!config_file.is_open()) {
@@ -146,6 +320,10 @@ bool parse_config(const std::string& filename, AppConfig& config) {
             else if (key == "batch_packet_count") config.batch_packet_count = std::stoi(value);
             else if (key == "max_queue_blocks") config.max_queue_blocks = std::stoul(value);
             else if (key == "send_buffer_size_kb") config.send_buffer_size_kb = std::stoi(value);
+            else if (key == "encrypt") { // Xử lý cấu hình mới
+                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+                config.encrypt = (value == "true");
+            }
             else if (key == "interfaces") {
                 std::stringstream val_ss(value);
                 std::string interface;
@@ -159,11 +337,16 @@ bool parse_config(const std::string& filename, AppConfig& config) {
     return !config.interfaces.empty();
 }
 
-// --- Luồng Capture (Producer) ---
+// --- Luồng Capture (Producer) - giữ nguyên ---
 void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppConfig& config, BoundedThreadSafeQueue<PacketBlock>& queue) {
+    // ... code giống hệt phiên bản cũ ...
     std::cout << "Capture thread for " << if_name << " started." << std::endl;
     PacketBlock current_block;
     current_block.reserve(config.batch_packet_count);
+
+    size_t packets_pushed = 0;
+    size_t packets_received = 0;
+    auto stats_start = std::chrono::steady_clock::now();
 
     while (!capture_interrupted) {
         pcap_pkthdr* header;
@@ -172,8 +355,10 @@ void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppCo
 
         if (ret == 1) {
             current_block.emplace_back(header, packet_data);
+            packets_received++; // Đếm luôn cả gói nhận được            
             if (current_block.size() >= static_cast<size_t>(config.batch_packet_count)) {
                 queue.push(std::move(current_block));
+                packets_pushed += config.batch_packet_count;                
                 current_block.clear();
                 current_block.reserve(config.batch_packet_count);
             }
@@ -190,6 +375,15 @@ void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppCo
             capture_interrupted = true;
             break;
         }
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - stats_start);
+        if (elapsed.count() >= 1) {
+            // std::cout << "Packets received in last second: " << packets_received
+            //         << ", Packets pushed to queue: " << packets_pushed << std::endl;
+            packets_received = 0;
+            packets_pushed = 0;
+            stats_start = now;
+        }        
     }
     if (!current_block.empty()) {
         queue.push(std::move(current_block));
@@ -197,8 +391,10 @@ void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppCo
     std::cout << "Capture thread for " << if_name << " finished." << std::endl;
 }
 
-// --- Luồng Sender (Consumer) ---
-void sender_thread_func(int client_socket, const AppConfig& config, BoundedThreadSafeQueue<PacketBlock>& queue) {
+// =================================================================
+// BƯỚC 4: SỬA ĐỔI SENDER THREAD ĐỂ DÙNG INTERFACE
+// =================================================================
+void sender_thread_func(IConnection& connection, const AppConfig& config, BoundedThreadSafeQueue<PacketBlock>& queue) {
     std::cout << "Sender thread started." << std::endl;
     PacketBlock block_to_send;
     std::vector<char> send_buffer;
@@ -209,6 +405,7 @@ void sender_thread_func(int client_socket, const AppConfig& config, BoundedThrea
         
         send_buffer.clear();
         for (const auto& packet : block_to_send) {
+            // ... logic serialize packet giữ nguyên ...
             uint32_t ts_sec_net = htonl(static_cast<uint32_t>(packet.header.ts.tv_sec));
             uint32_t ts_usec_net = htonl(static_cast<uint32_t>(packet.header.ts.tv_usec));
             uint32_t caplen_net = htonl(packet.header.caplen);
@@ -229,7 +426,8 @@ void sender_thread_func(int client_socket, const AppConfig& config, BoundedThrea
         }
 
         if (!send_buffer.empty()) {
-            if (!send_all_data(client_socket, send_buffer.data(), send_buffer.size())) {
+            // Thay đổi ở đây: gọi phương thức của interface
+            if (!connection.send_data(send_buffer.data(), send_buffer.size())) {
                 std::cerr << "Failed to send data batch to server. Stopping." << std::endl;
                 capture_interrupted = true;
                 queue.shutdown();
@@ -243,20 +441,19 @@ void sender_thread_func(int client_socket, const AppConfig& config, BoundedThrea
 }
 
 // --- Signal Handler ---
-BoundedThreadSafeQueue<PacketBlock>* global_queue_ptr = nullptr;
 void signal_handler(int signum) {
     std::cout << "\nSignal " << signum << " received. Shutting down..." << std::endl;
     capture_interrupted = true;
-    // if (global_queue_ptr) {
-    //     global_queue_ptr->shutdown();
-    // }
     std::lock_guard<std::mutex> lock(global_handles_mutex);
     for (pcap_t* handle : global_pcap_handles) {
         if (handle) pcap_breakloop(handle);
     }
 }
 
-// --- Main Function ---
+
+// =================================================================
+// BƯỚC 4: SỬA ĐỔI MAIN ĐỂ DÙNG FACTORY VÀ INTERFACE
+// =================================================================
 int main() {
     AppConfig config;
     if (!parse_config("config.txt", config)) {
@@ -264,22 +461,21 @@ int main() {
         return 1;
     }
     
-    // Tạo queue với kích thước từ config
     BoundedThreadSafeQueue<PacketBlock> packet_queue(config.max_queue_blocks);
-    global_queue_ptr = &packet_queue;
-
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
+    // Phần capture threads giữ nguyên
     std::vector<std::thread> capture_threads;
     std::map<uint32_t, std::string> interface_map;
     char errbuf[PCAP_ERRBUF_SIZE];
     int link_type = -1;
 
     for (size_t i = 0; i < config.interfaces.size(); ++i) {
+        // ... code khởi tạo pcap giữ nguyên ...
         const auto& if_name = config.interfaces[i];
         pcap_t* handle = pcap_create(if_name.c_str(), errbuf);
-        if (!handle) { /* ... error handling ... */ continue; }
+        if (!handle) { /* ... */ continue; }
         
         pcap_set_buffer_size(handle, config.pcap_buffer_size_mb * 1024 * 1024);
         pcap_set_snaplen(handle, 65535);
@@ -287,7 +483,7 @@ int main() {
         pcap_set_timeout(handle, 1);
         pcap_set_tstamp_precision(handle, PCAP_TSTAMP_PRECISION_NANO);
         
-        if (pcap_activate(handle) < 0) { /* ... error handling ... */ continue; }
+        if (pcap_activate(handle) < 0) { /* ... */ continue; }
         
         if (link_type == -1) link_type = pcap_datalink(handle);
         
@@ -297,23 +493,25 @@ int main() {
         interface_map[i] = if_name;
         capture_threads.emplace_back(capture_thread_func, handle, if_name, std::cref(config), std::ref(packet_queue));
     }
+    if (global_pcap_handles.empty()) { /* ... */ return 1; }
 
-    if (global_pcap_handles.empty()) { /* ... error handling ... */ return 1; }
+    // --- THAY ĐỔI LỚN Ở ĐÂY ---
+    // 1. Tạo đối tượng kết nối bằng Factory
+    auto connection = create_connection(config);
 
-    int client_socket = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(config.server_port);
-    inet_pton(AF_INET, config.server_ip.c_str(), &serv_addr.sin_addr);
-    
-    if (connect(client_socket, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("Connect failed");
+    // 2. Kết nối bằng phương thức của đối tượng
+    if (!connection->connect(config.server_ip, config.server_port)) {
+        std::cerr << "Agent: Could not connect to server. Shutting down capture." << std::endl;
         capture_interrupted = true;
         packet_queue.shutdown();
     } else {
         std::cout << "Agent: Connected to server." << std::endl;
+        // Gửi thông tin link_type qua interface
         uint32_t link_type_net = htonl(static_cast<uint32_t>(link_type));
-        if (!send_all_data(client_socket, &link_type_net, sizeof(link_type_net))) return 1;
+        if (!connection->send_data(&link_type_net, sizeof(link_type_net))) {
+             std::cerr << "Agent: Failed to send link type. Exiting." << std::endl;
+             return 1;
+        }
     }
 
     auto capture_start_time = std::chrono::high_resolution_clock::now();
@@ -321,9 +519,11 @@ int main() {
     
     std::thread sender_t;
     if (!capture_interrupted) {
-        sender_t = std::thread(sender_thread_func, client_socket, std::cref(config), std::ref(packet_queue));
+        // 3. Truyền đối tượng connection vào sender thread
+        sender_t = std::thread(sender_thread_func, std::ref(*connection), std::cref(config), std::ref(packet_queue));
     }
     
+    // ... Phần còn lại của main giữ nguyên ...
     std::cout << "Main: Waiting for capture threads to finish..." << std::endl;
     for(auto& t : capture_threads) { if(t.joinable()) t.join(); }
     std::cout << "Main: All capture threads have finished." << std::endl;
@@ -335,7 +535,6 @@ int main() {
     if (sender_t.joinable()) sender_t.join();
     std::cout << "Main: Sender thread has finished." << std::endl;
     
-    // ... Phần in thống kê giữ nguyên ...
     auto capture_end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = capture_end_time - capture_start_time;
 
@@ -365,7 +564,9 @@ int main() {
         global_pcap_handles.clear();
     }    
     
-    close(client_socket);
+    // Không cần close socket thủ công nữa.
+    // std::unique_ptr `connection` sẽ tự động gọi destructor
+    // và `disconnect()` khi ra khỏi scope của hàm main.
     std::cout << "Agent: Exiting." << std::endl;
     return 0;
 }

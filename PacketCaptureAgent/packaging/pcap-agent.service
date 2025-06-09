@@ -1,0 +1,18 @@
+[Unit]
+Description=PCAP Packet Capture Agent
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/PacketCaptureAgent
+User=root
+Group=root
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+Type=simple
+
+[Install]
+WantedBy=multi-user.target

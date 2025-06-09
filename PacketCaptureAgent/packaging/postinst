@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# Báo cho systemd tải lại các file cấu hình mới
+systemctl daemon-reload
+
+# Bật dịch vụ để nó tự khởi động cùng hệ thống
+systemctl enable pcap-agent.service
+
+# Khởi động dịch vụ ngay sau khi cài đặt (nếu không phải là đang nâng cấp)
+if [ "$1" = "configure" ]; then
+    systemctl start pcap-agent.service || true
+fi
+
+echo "PacketCaptureAgent service has been installed and started."
+echo "Check status with: systemctl status pcap-agent.service"
+echo "View logs with: journalctl -u pcap-agent.service -f"
+
+exit 0

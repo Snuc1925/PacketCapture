@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+# Dừng và vô hiệu hóa dịch vụ trước khi gỡ bỏ file
+systemctl stop pcap-agent.service || true
+systemctl disable pcap-agent.service || true
+
+echo "PacketCaptureAgent service has been stopped and disabled."
+
+exit 0

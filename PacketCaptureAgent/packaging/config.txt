@@ -1,0 +1,16 @@
+# Pcap Agent Configuration File
+# -----------------------------
+# Managed by the .deb package. Do not overwrite on upgrade.
+
+# IP address of the server to send packets to
+server_ip = 127.0.0.1
+
+# Port of the server
+server_port = 8888
+
+# Comma-separated list of network interfaces to capture from
+# Example: interfaces = eth0,wlan0
+interfaces = veth0, veth2
+
+# Pcap internal buffer size in Megabytes (MB)
+pcap_buffer_size_mb = 32
