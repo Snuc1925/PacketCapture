@@ -14,7 +14,6 @@
 #include <sstream>
 #include <algorithm>
 #include <memory> // For std::unique_ptr
-
 // System headers
 #include <pcap.h>
 #include <cstring>
@@ -37,6 +36,13 @@ struct AppConfig {
     size_t max_queue_blocks = 1024;
     int send_buffer_size_kb = 4096;
     bool encrypt = false; // Thêm cấu hình mã hóa
+};
+
+struct TrafficFilter {
+    std::string ip_src;
+    std::string ip_dst;
+    std::string port;
+    std::string protocol;
 };
 
 // ... Các phần khác như BoundedThreadSafeQueue, CapturedPacket giữ nguyên ...
@@ -337,6 +343,61 @@ bool parse_config(const std::string& filename, AppConfig& config) {
     return !config.interfaces.empty();
 }
 
+bool parse_filter_config(const std::string& filename, TrafficFilter& filter) {
+    std::ifstream filter_file(filename);
+    if (!filter_file.is_open()) {
+        std::cout << "Info: Filter file '" << filename << "' not found. Proceeding without traffic filter." << std::endl;
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(filter_file, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+
+        std::stringstream ss(line);
+        std::string key, value;
+        if (std::getline(ss, key, '=')) {
+            std::getline(ss, value);
+            key = trim(key);
+            value = trim(value);
+
+            if (key == "ip_src") filter.ip_src = value;
+            else if (key == "ip_dst") filter.ip_dst = value;
+            else if (key == "port") filter.port = value;
+            else if (key == "protocol") filter.protocol = value;
+        }
+    }
+    return true;
+}
+
+// BƯỚC 4: TẠO HÀM ĐỂ XÂY DỰNG CHUỖI BPF
+std::string build_bpf_string(const TrafficFilter& filter) {
+    std::vector<std::string> parts;
+    if (!filter.ip_src.empty()) {
+        parts.push_back("src host " + filter.ip_src);
+    }
+    if (!filter.ip_dst.empty()) {
+        parts.push_back("dst host " + filter.ip_dst);
+    }
+    if (!filter.port.empty()) {
+        parts.push_back("port " + filter.port);
+    }
+    if (!filter.protocol.empty()) {
+        parts.push_back(filter.protocol);
+    }
+
+    if (parts.empty()) {
+        return ""; // Trả về chuỗi rỗng nếu không có quy tắc nào
+    }
+
+    std::string bpf_string = parts[0];
+    for (size_t i = 1; i < parts.size(); ++i) {
+        bpf_string += " and " + parts[i];
+    }
+    return bpf_string;
+}
+
 // --- Luồng Capture (Producer) - giữ nguyên ---
 void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppConfig& config, BoundedThreadSafeQueue<PacketBlock>& queue) {
     // ... code giống hệt phiên bản cũ ...
@@ -460,7 +521,16 @@ int main() {
         std::cerr << "Failed to parse config.txt or no interfaces specified. Exiting." << std::endl;
         return 1;
     }
-    
+
+    // --- ĐỌC CẤU HÌNH LỌC VÀ TẠO CHUỖI BPF ---
+    TrafficFilter filter_config;
+    parse_filter_config("filter.txt", filter_config);
+    std::string bpf_filter_string = build_bpf_string(filter_config);
+
+    if (!bpf_filter_string.empty()) {
+        std::cout << "Agent: Applying BPF filter: \"" << bpf_filter_string << "\"" << std::endl;
+    }    
+
     BoundedThreadSafeQueue<PacketBlock> packet_queue(config.max_queue_blocks);
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -483,7 +553,31 @@ int main() {
         pcap_set_timeout(handle, 1);
         pcap_set_tstamp_precision(handle, PCAP_TSTAMP_PRECISION_NANO);
         
-        if (pcap_activate(handle) < 0) { /* ... */ continue; }
+        if (pcap_activate(handle) < 0) {
+            std::cerr << "Error activating interface " << if_name << ": " << pcap_geterr(handle) << std::endl;
+            pcap_close(handle);
+            continue;
+        }
+
+        // --- ÁP DỤNG BỘ LỌC BPF ---
+        if (!bpf_filter_string.empty()) {
+            struct bpf_program fp;
+            // Chú ý: pcap_compile cần handle đã được activate
+            if (pcap_compile(handle, &fp, bpf_filter_string.c_str(), 1, PCAP_NETMASK_UNKNOWN) == -1) {
+                std::cerr << "Error compiling BPF filter for " << if_name << ": " << pcap_geterr(handle) << std::endl;
+                pcap_close(handle);
+                continue; // Bỏ qua interface này nếu filter bị lỗi
+            }
+
+            if (pcap_setfilter(handle, &fp) == -1) {
+                std::cerr << "Error setting BPF filter for " << if_name << ": " << pcap_geterr(handle) << std::endl;
+                pcap_freecode(&fp);
+                pcap_close(handle);
+                continue; // Bỏ qua interface này nếu không set được filter
+            }
+            pcap_freecode(&fp); // Giải phóng bộ nhớ của chương trình filter đã compile
+        }        
+
         
         if (link_type == -1) link_type = pcap_datalink(handle);
         
@@ -493,7 +587,12 @@ int main() {
         interface_map[i] = if_name;
         capture_threads.emplace_back(capture_thread_func, handle, if_name, std::cref(config), std::ref(packet_queue));
     }
-    if (global_pcap_handles.empty()) { /* ... */ return 1; }
+
+    
+    if (global_pcap_handles.empty()) {
+        std::cerr << "Agent: No interfaces were successfully initialized. Exiting." << std::endl;
+        return 1;
+    }
 
     // --- THAY ĐỔI LỚN Ở ĐÂY ---
     // 1. Tạo đối tượng kết nối bằng Factory
