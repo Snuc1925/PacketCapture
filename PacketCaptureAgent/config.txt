@@ -1,27 +1,9 @@
-# Config file for Packet Capture Agent
-
-# -- Server-side Configuration --
 server_ip = 127.0.0.1
 server_port = 8888
-
-# -- Capture Configuration --
-# Comma-separated list of interfaces to capture on
+protocol = TCP
 interfaces = veth1,veth3
-
-# Pcap kernel buffer size per interface, in Megabytes (MB)
 pcap_buffer_size_mb = 32
-
-# -- Performance Tuning --
-# Number of packets to batch in user-space before pushing to the main queue
-# Giúp giảm contention giữa các luồng capture
 batch_packet_count = 256
-
-# Size of the main user-space queue (in number of blocks)
-# QUAN TRỌNG: Ngăn chặn lỗi Out-Of-Memory.
-# Đây là số "lô" (mỗi lô có `batch_packet_count` gói tin) mà queue có thể chứa.
-# Ví dụ: 1024 * 256 = 262144 gói tin tổng cộng trong queue.
-max_queue_blocks = 1024
-
-# Size of the socket send buffer in user-space, in Kilobytes (KB)
-# Giúp giảm số lượng system call `send()`
+max_queue_blocks = 2048
 send_buffer_size_kb = 4096
+encrypt = false

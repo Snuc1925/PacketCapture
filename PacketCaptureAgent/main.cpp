@@ -13,8 +13,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
-#include <memory> // For std::unique_ptr
-// System headers
+#include <memory> 
 #include <pcap.h>
 #include <cstring>
 #include <unistd.h>
@@ -112,10 +111,6 @@ public:
     }
 };
 
-
-// =================================================================
-// BƯỚC 1: ĐỊNH NGHĨA INTERFACE CHO KẾT NỐI (STRATEGY PATTERN)
-// =================================================================
 class IConnection {
 public:
     virtual ~IConnection() = default; // Destructor ảo là BẮT BUỘC
@@ -124,10 +119,6 @@ public:
     virtual void disconnect() = 0;
 };
 
-
-// =================================================================
-// BƯỚC 2: TRIỂN KHAI CÁC LỚP KẾT NỐI CỤ THỂ
-// =================================================================
 
 // --- Lớp cho kết nối TCP thông thường (không mã hóa) ---
 class PlainTcpConnection : public IConnection {
@@ -141,6 +132,7 @@ public:
 
     bool connect(const std::string& ip, int port) override {
         sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
+
         if (sockfd_ < 0) {
             perror("Socket creation failed");
             return false;
@@ -188,7 +180,6 @@ public:
     }
 };
 
-// --- Lớp cho kết nối TLS (mã hóa) sử dụng OpenSSL ---
 class TlsConnection : public IConnection {
 private:
     int sockfd_ = -1;
@@ -280,9 +271,6 @@ public:
     }
 };
 
-// =================================================================
-// BƯỚC 3: TẠO FACTORY ĐỂ CHỌN CHIẾN LƯỢC
-// =================================================================
 std::unique_ptr<IConnection> create_connection(const AppConfig& config) {
     if (config.encrypt) {
         std::cout << "TLS Connection!!!" << std::endl;
@@ -293,8 +281,6 @@ std::unique_ptr<IConnection> create_connection(const AppConfig& config) {
     }
 }
 
-// --- Hàm đọc cấu hình mới ---
-// Hàm trim
 std::string trim(const std::string& s) {
     size_t first = s.find_first_not_of(" \t\n\r");
     if (std::string::npos == first) return s;
@@ -340,6 +326,15 @@ bool parse_config(const std::string& filename, AppConfig& config) {
             }
         }
     }
+
+    std::cout << "Loaded configuration:\n";
+    std::cout << "  server_ip            = " << config.server_ip << "\n";
+    std::cout << "  server_port          = " << config.server_port << "\n";
+    std::cout << "  pcap_buffer_size_mb  = " << config.pcap_buffer_size_mb << "\n";
+    std::cout << "  batch_packet_count   = " << config.batch_packet_count << "\n";
+    std::cout << "  max_queue_blocks     = " << config.max_queue_blocks << "\n";
+    std::cout << "  send_buffer_size_kb  = " << config.send_buffer_size_kb << "\n";
+
     return !config.interfaces.empty();
 }
 
@@ -371,7 +366,6 @@ bool parse_filter_config(const std::string& filename, TrafficFilter& filter) {
     return true;
 }
 
-// BƯỚC 4: TẠO HÀM ĐỂ XÂY DỰNG CHUỖI BPF
 std::string build_bpf_string(const TrafficFilter& filter) {
     std::vector<std::string> parts;
     if (!filter.ip_src.empty()) {
@@ -398,15 +392,15 @@ std::string build_bpf_string(const TrafficFilter& filter) {
     return bpf_string;
 }
 
-// --- Luồng Capture (Producer) - giữ nguyên ---
 void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppConfig& config, BoundedThreadSafeQueue<PacketBlock>& queue) {
-    // ... code giống hệt phiên bản cũ ...
     std::cout << "Capture thread for " << if_name << " started." << std::endl;
     PacketBlock current_block;
     current_block.reserve(config.batch_packet_count);
 
     size_t packets_pushed = 0;
     size_t packets_received = 0;
+    size_t bytes_received = 0;
+
     auto stats_start = std::chrono::steady_clock::now();
 
     while (!capture_interrupted) {
@@ -416,10 +410,12 @@ void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppCo
 
         if (ret == 1) {
             current_block.emplace_back(header, packet_data);
-            packets_received++; // Đếm luôn cả gói nhận được            
+            packets_received++;
+            bytes_received += header->caplen;
+
             if (current_block.size() >= static_cast<size_t>(config.batch_packet_count)) {
                 queue.push(std::move(current_block));
-                packets_pushed += config.batch_packet_count;                
+                packets_pushed += config.batch_packet_count;
                 current_block.clear();
                 current_block.reserve(config.batch_packet_count);
             }
@@ -436,46 +432,57 @@ void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppCo
             capture_interrupted = true;
             break;
         }
+
         auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - stats_start);
-        if (elapsed.count() >= 1) {
-            // std::cout << "Packets received in last second: " << packets_received
-            //         << ", Packets pushed to queue: " << packets_pushed << std::endl;
+        auto elapsed = std::chrono::duration<double>(now - stats_start);
+        if (elapsed.count() >= 1.0) {
+            double mbps = (bytes_received * 8.0) / 1e6; // Megabit
+            std::cout << std::fixed << std::setprecision(2)
+                      << "Stats (" << if_name << ") [elapsed: " << elapsed.count() << "s]: "
+                      << "Packets received: " << packets_received
+                      << ", Pushed: " << packets_pushed
+                      << ", Traffic: " << mbps << " Mb/s" << std::endl;
+
             packets_received = 0;
             packets_pushed = 0;
+            bytes_received = 0;
             stats_start = now;
-        }        
+        }
     }
+
     if (!current_block.empty()) {
         queue.push(std::move(current_block));
     }
+
     std::cout << "Capture thread for " << if_name << " finished." << std::endl;
 }
 
-// =================================================================
-// BƯỚC 4: SỬA ĐỔI SENDER THREAD ĐỂ DÙNG INTERFACE
-// =================================================================
+
 void sender_thread_func(IConnection& connection, const AppConfig& config, BoundedThreadSafeQueue<PacketBlock>& queue) {
     std::cout << "Sender thread started." << std::endl;
+
     PacketBlock block_to_send;
     std::vector<char> send_buffer;
     send_buffer.reserve(static_cast<size_t>(config.send_buffer_size_kb) * 1024);
 
+    size_t total_bytes_sent_local = 0;
+    size_t total_packets_sent_local = 0;
+    auto stats_start = std::chrono::steady_clock::now();
+
     while (true) {
         if (!queue.pop(block_to_send)) break;
-        
+
         send_buffer.clear();
         for (const auto& packet : block_to_send) {
-            // ... logic serialize packet giữ nguyên ...
             uint32_t ts_sec_net = htonl(static_cast<uint32_t>(packet.header.ts.tv_sec));
             uint32_t ts_usec_net = htonl(static_cast<uint32_t>(packet.header.ts.tv_usec));
             uint32_t caplen_net = htonl(packet.header.caplen);
             uint32_t len_net = htonl(packet.header.len);
-            
+
             size_t current_pos = send_buffer.size();
             size_t packet_total_size = sizeof(uint32_t) * 4 + packet.header.caplen;
             send_buffer.resize(current_pos + packet_total_size);
-            
+
             char* ptr = send_buffer.data() + current_pos;
             memcpy(ptr, &ts_sec_net, sizeof(ts_sec_net)); ptr += sizeof(ts_sec_net);
             memcpy(ptr, &ts_usec_net, sizeof(ts_usec_net)); ptr += sizeof(ts_usec_net);
@@ -487,7 +494,6 @@ void sender_thread_func(IConnection& connection, const AppConfig& config, Bounde
         }
 
         if (!send_buffer.empty()) {
-            // Thay đổi ở đây: gọi phương thức của interface
             if (!connection.send_data(send_buffer.data(), send_buffer.size())) {
                 std::cerr << "Failed to send data batch to server. Stopping." << std::endl;
                 capture_interrupted = true;
@@ -496,10 +502,30 @@ void sender_thread_func(IConnection& connection, const AppConfig& config, Bounde
             }
             total_bytes_sent += send_buffer.size();
             total_packets_sent += block_to_send.size();
+
+            total_bytes_sent_local += send_buffer.size();
+            total_packets_sent_local += block_to_send.size();
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration<double>(now - stats_start);
+        if (elapsed.count() >= 1.0) {
+            double mbps = (total_bytes_sent_local * 8.0) / 1e6; // megabits per second
+            std::cout << std::fixed << std::setprecision(2)
+                      << "Sender stats [elapsed: " << elapsed.count() << "s]: "
+                      << "Packets sent: " << total_packets_sent_local
+                      << ", Bytes sent: " << total_bytes_sent_local
+                      << ", Bandwidth: " << mbps << " Mb/s" << std::endl;
+
+            total_bytes_sent_local = 0;
+            total_packets_sent_local = 0;
+            stats_start = now;
         }
     }
+
     std::cout << "Sender thread finished." << std::endl;
 }
+
 
 // --- Signal Handler ---
 void signal_handler(int signum) {
@@ -512,9 +538,6 @@ void signal_handler(int signum) {
 }
 
 
-// =================================================================
-// BƯỚC 4: SỬA ĐỔI MAIN ĐỂ DÙNG FACTORY VÀ INTERFACE
-// =================================================================
 int main() {
     AppConfig config;
     if (!parse_config("config.txt", config)) {
@@ -594,18 +617,14 @@ int main() {
         return 1;
     }
 
-    // --- THAY ĐỔI LỚN Ở ĐÂY ---
-    // 1. Tạo đối tượng kết nối bằng Factory
     auto connection = create_connection(config);
 
-    // 2. Kết nối bằng phương thức của đối tượng
     if (!connection->connect(config.server_ip, config.server_port)) {
         std::cerr << "Agent: Could not connect to server. Shutting down capture." << std::endl;
         capture_interrupted = true;
         packet_queue.shutdown();
     } else {
         std::cout << "Agent: Connected to server." << std::endl;
-        // Gửi thông tin link_type qua interface
         uint32_t link_type_net = htonl(static_cast<uint32_t>(link_type));
         if (!connection->send_data(&link_type_net, sizeof(link_type_net))) {
              std::cerr << "Agent: Failed to send link type. Exiting." << std::endl;
@@ -618,11 +637,9 @@ int main() {
     
     std::thread sender_t;
     if (!capture_interrupted) {
-        // 3. Truyền đối tượng connection vào sender thread
         sender_t = std::thread(sender_thread_func, std::ref(*connection), std::cref(config), std::ref(packet_queue));
     }
     
-    // ... Phần còn lại của main giữ nguyên ...
     std::cout << "Main: Waiting for capture threads to finish..." << std::endl;
     for(auto& t : capture_threads) { if(t.joinable()) t.join(); }
     std::cout << "Main: All capture threads have finished." << std::endl;
@@ -663,9 +680,6 @@ int main() {
         global_pcap_handles.clear();
     }    
     
-    // Không cần close socket thủ công nữa.
-    // std::unique_ptr `connection` sẽ tự động gọi destructor
-    // và `disconnect()` khi ra khỏi scope của hàm main.
     std::cout << "Agent: Exiting." << std::endl;
     return 0;
 }
