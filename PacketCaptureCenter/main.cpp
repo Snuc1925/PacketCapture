@@ -241,10 +241,72 @@ int create_listening_socket(int port) {
     return sock;
 }
 
+class LivePcapStreamer {
+private:
+    pcap_t* pcap_handle_ = nullptr;
+    pcap_dumper_t* dumper_ = nullptr;
+
+public:
+    ~LivePcapStreamer() {
+        close_stream();
+    }
+
+    // Mở stream bằng cách sử dụng chính các hàm của libpcap
+    bool open_stream(const std::string& pipe_path, int datalink_type) {
+        // 1. Tạo một pcap handle "chết" (không dùng để bắt gói tin)
+        // Nó chỉ là một context cần thiết cho việc ghi file.
+        pcap_handle_ = pcap_open_dead(datalink_type, 65535 /* snaplen */);
+        if (!pcap_handle_) {
+            std::cerr << "LivePcapStreamer Error: pcap_open_dead failed." << std::endl;
+            return false;
+        }
+
+        // 2. Mở dumper để ghi vào pipe. Libpcap sẽ tự động ghi Global Header.
+        // Hàm này sẽ tự gọi fopen(pipe_path, "wb") bên trong.
+        dumper_ = pcap_dump_open(pcap_handle_, pipe_path.c_str());
+        if (!dumper_) {
+            std::cerr << "LivePcapStreamer Error: pcap_dump_open failed: " << pcap_geterr(pcap_handle_) << std::endl;
+            std::cerr << "Hint: Did you run 'mkfifo " << pipe_path << "' and run Wireshark first?" << std::endl;
+            pcap_close(pcap_handle_);
+            pcap_handle_ = nullptr;
+            return false;
+        }
+
+        std::cout << "Live Stream: Pcap dumper successfully opened on " << pipe_path << std::endl;
+        return true;
+    }
+
+    // Ghi một gói tin. Hàm này giờ trở nên cực kỳ đơn giản.
+    void write_packet(const pcap_pkthdr* header, const unsigned char* data) {
+        if (!dumper_) {
+            return;
+        }
+        // Để libpcap lo tất cả mọi thứ: endianness, struct size, ...
+        pcap_dump(reinterpret_cast<u_char*>(dumper_), header, data);
+    }
+
+    void close_stream() {
+        if (dumper_) {
+            pcap_dump_close(dumper_);
+            dumper_ = nullptr;
+        }
+        if (pcap_handle_) {
+            pcap_close(pcap_handle_);
+            pcap_handle_ = nullptr;
+        }
+        std::cout << "Live Stream: Closed." << std::endl;
+    }
+
+    bool is_open() const {
+        return dumper_ != nullptr;
+    }
+};
+
 //========================================================
 // MAIN FUNCTION
 //========================================================
 int main() {
+        fprintf(stderr, ">>> sizeof(pcap_pkthdr) = %zu bytes\n", sizeof(pcap_pkthdr));
     // --- Khởi tạo Socket thường và TLS (không đổi) ---
     int tcp_server_sock = create_listening_socket(PLAIN_TCP_PORT);
     if (tcp_server_sock < 0) return 1;
@@ -263,6 +325,10 @@ int main() {
     FD_SET(tls_server_sock, &master_fds);
     int fd_max = std::max(tcp_server_sock, tls_server_sock);
     std::map<int, ClientState> clients_state;
+
+    LivePcapStreamer live_streamer;
+    const std::string live_pipe_path = "/tmp/live_stream.pcap";
+    bool streamer_initialized = false;    
 
     while (true) {
         read_fds = master_fds;
@@ -311,6 +377,12 @@ int main() {
                 clients_state.emplace(client_sock,
                     ClientState(std::move(new_connection), std::string(client_ip), client_port)
                 );
+
+                if (!streamer_initialized) {
+                    std::cout << "Live Stream: First client connected. Attempting to open pipe..." << std::endl;
+                    // Chờ Wireshark mở pipe để đọc
+                    // Ta sẽ thử mở streamer khi nhận được datalink_type
+                }                
             }
             // --- XỬ LÝ DỮ LIỆU TỪ CLIENT (PHẦN THAY ĐỔI CHÍNH) ---
             else {
@@ -355,7 +427,18 @@ int main() {
                                     memcpy(&link_type_net, client.recv_buffer.data(), METADATA_SIZE_LINKTYPE);
                                     client.datalink_type = static_cast<int>(ntohl(link_type_net));
                                     client.recv_buffer.erase(client.recv_buffer.begin(), client.recv_buffer.begin() + METADATA_SIZE_LINKTYPE);
+
+                                    if (!streamer_initialized) {
+                                        if (live_streamer.open_stream(live_pipe_path, client.datalink_type)) {
+                                            streamer_initialized = true;
+                                            std::cout << "Live Stream: Successfully opened for real-time analysis." << std::endl;
+                                        } else {
+                                            std::cout << "Live Stream: Failed to open. Run Wireshark first: "
+                                                    << "'wireshark -k -i " << live_pipe_path << "'" << std::endl;
+                                        }
+                                    }                                    
                                     
+
                                     // Chuyển sang trạng thái chờ block header
                                     client.current_fsm_state = ClientState::ReceiveFSM::AWAITING_BLOCK_HEADER;
                                     processed_data_in_this_pass = true;
@@ -440,7 +523,17 @@ int main() {
                                             pkt.header.caplen = caplen;
                                             pkt.header.len = ntohl(len_net);
                                             pkt.data.assign(reinterpret_cast<const unsigned char*>(packet_ptr), reinterpret_cast<const unsigned char*>(packet_ptr) + caplen);
-                                            
+
+    fprintf(stderr, "[DEBUG-FSM] Parsed Packet: ts=%u.%06u, caplen=%u, len=%u\n",
+            (unsigned int)pkt.header.ts.tv_sec,
+            (unsigned int)pkt.header.ts.tv_usec,
+            pkt.header.caplen,
+            pkt.header.len);                                            
+
+                                            if (live_streamer.is_open()) {
+                                                live_streamer.write_packet(&pkt.header, pkt.data.data());
+                                            }                                            
+
                                             client.buffered_packets.push_back(std::move(pkt));
                                             client.current_total_bytes += caplen;
                                             client.current_total_packets++;
@@ -482,6 +575,6 @@ int main() {
     close(tcp_server_sock);
     close(tls_server_sock);
     std::cout << "Server shutdown complete." << std::endl;
-
+    live_streamer.close_stream();
     return 0;
 }

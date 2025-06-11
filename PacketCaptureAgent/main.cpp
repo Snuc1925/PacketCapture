@@ -695,7 +695,7 @@ int main() {
         pcap_set_snaplen(handle, 65535);
         pcap_set_promisc(handle, 1);
         pcap_set_timeout(handle, 1);
-        pcap_set_tstamp_precision(handle, PCAP_TSTAMP_PRECISION_NANO);
+        pcap_set_tstamp_precision(handle, PCAP_TSTAMP_PRECISION_MICRO);
         
         if (pcap_activate(handle) < 0) {
             std::cerr << "Error activating interface " << if_name << ": " << pcap_geterr(handle) << std::endl;
