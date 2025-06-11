@@ -52,6 +52,20 @@ if(NOT UDT_LIBRARY OR NOT UDT_INCLUDE_DIR)
     message(FATAL_ERROR "UDT not found. Ensure UDT library (libudt) and headers (udt.h) are installed or built correctly. Check expected lib/ and include/ paths.")
 endif()
 
+# Tìm thư viện Zstd
+find_library(ZSTD_LIBRARY zstd
+  PATHS /usr/lib /usr/local/lib
+)
+
+# Tìm header Zstd
+find_path(ZSTD_INCLUDE_DIR zstd.h
+  PATHS /usr/include /usr/local/include
+)
+
+if(NOT ZSTD_LIBRARY OR NOT ZSTD_INCLUDE_DIR)
+    message(FATAL_ERROR "Zstd not found. Install with: sudo apt install libzstd-dev")
+endif()
+
 
 # Sử dụng các biến trả về từ FindPackage cho OpenSSL và Threads
 find_package(OpenSSL REQUIRED)
@@ -64,6 +78,7 @@ target_link_libraries(PacketCaptureAgent
     ${PFRING_LIBRARY}       # Liên kết với thư viện pfring
     ${PCAP_LIBRARY}  
     ${UDT_LIBRARY}          # Liên kết với thư viện pcap
+    ${ZSTD_LIBRARY}
     Threads::Threads
     OpenSSL::SSL
     OpenSSL::Crypto
@@ -74,9 +89,7 @@ target_include_directories(PacketCaptureAgent PRIVATE
     ${PFRING_INCLUDE_DIR} # Sử dụng biến chứa đường dẫn header của PF_RING
     ${OpenSSL_INCLUDE_DIRS} # Sử dụng biến chứa đường dẫn header của OpenSSL
     ${UDT_INCLUDE_DIR}
-    # === THAY ĐỔI (Tùy chọn): Thêm include path cho pcap nếu cần ===
-    # find_path(PCAP_INCLUDE_DIR pcap.h) # Tìm path header pcap
-    # ${PCAP_INCLUDE_DIR}
+    ${ZSTD_INCLUDE_DIR}
 )
 
 message(STATUS "Configured PacketCaptureAgent with PF_RING, pcap, OpenSSL, and Threads.")

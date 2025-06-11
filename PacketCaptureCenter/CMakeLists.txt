@@ -30,6 +30,16 @@ if(NOT UDT_LIBRARY OR NOT UDT_INCLUDE_DIR)
     message(FATAL_ERROR "UDT not found. Ensure UDT library (libudt) and headers (udt.h) are installed or built correctly. Check expected lib/ and include/ paths.")
 endif()
 
+# Tìm thư viện Zstd
+find_library(ZSTD_LIBRARY zstd
+  PATHS /usr/lib /usr/local/lib
+)
+
+# Tìm header Zstd
+find_path(ZSTD_INCLUDE_DIR zstd.h
+  PATHS /usr/include /usr/local/include
+)
+
 
 find_package(OpenSSL REQUIRED)
 # Tìm threads
@@ -40,7 +50,8 @@ add_executable(PacketCaptureCenter main.cpp)
 # Link với pcap và threads cho Linux
 target_link_libraries(PacketCaptureCenter 
     ${PCAP_LIBRARY} 
-        ${UDT_LIBRARY}  
+    ${UDT_LIBRARY}  
+    ${ZSTD_LIBRARY}
     Threads::Threads
     OpenSSL::SSL          # Thư viện SSL của OpenSSL
     OpenSSL::Crypto       # Thư viện Crypto của OpenSSL
@@ -48,6 +59,7 @@ target_link_libraries(PacketCaptureCenter
 
 # Thêm include directories nếu cần
 target_include_directories(PacketCaptureCenter PRIVATE 
-${UDT_INCLUDE_DIR}
-/usr/include/pcap
+    ${UDT_INCLUDE_DIR}
+    ${ZSTD_INCLUDE_DIR}
+    /usr/include/pcap
 )

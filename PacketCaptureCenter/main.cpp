@@ -24,20 +24,26 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+// Zstandard header
+#include <zstd.h> // *** THÊM THƯ VIỆN ZSTD ***
+
 // --- Cấu hình Server ---
 const int PLAIN_TCP_PORT = 8888;
-const int TLS_PORT = 8889; // Cổng riêng cho TLS
+const int TLS_PORT = 8889;
 const size_t MAX_BUFFER_SIZE_PER_CLIENT = 1024 * 1024 * 1024; // 1 GB
 const int MAX_CLIENTS = FD_SETSIZE;
 
 // Kích thước các phần của thông điệp từ agent
+const uint8_t FLAG_COMPRESSED_ZSTD = (1 << 0);
 const size_t METADATA_SIZE_LINKTYPE = sizeof(uint32_t);
+const size_t BLOCK_HEADER_SIZE = sizeof(uint8_t) + sizeof(uint32_t) + sizeof(uint32_t);
 const size_t PCAP_FIELDS_HEADER_SIZE = sizeof(uint32_t) * 4;
+
 
 //========================================================
 // LỚP TRỪU TƯỢNG VÀ CÁC LỚP CON CHO KẾT NỐI CLIENT
+// (Không thay đổi)
 //========================================================
-
 class IClientConnection {
 public:
     virtual ~IClientConnection() = default;
@@ -47,30 +53,18 @@ public:
     virtual std::string get_type() const = 0;
 };
 
-// --- Lớp cho kết nối TCP thường ---
 class PlainTcpClient : public IClientConnection {
 private:
     int fd_;
 public:
     explicit PlainTcpClient(int fd) : fd_(fd) {}
     ~PlainTcpClient() override { close_connection(); }
-
     int get_fd() const override { return fd_; }
-    
-    ssize_t read(char* buffer, size_t size) override {
-        return recv(fd_, buffer, size, 0);
-    }
-
-    void close_connection() override {
-        if (fd_ != -1) {
-            close(fd_);
-            fd_ = -1;
-        }
-    }
+    ssize_t read(char* buffer, size_t size) override { return recv(fd_, buffer, size, 0); }
+    void close_connection() override { if (fd_ != -1) { close(fd_); fd_ = -1; } }
     std::string get_type() const override { return "Plain TCP"; }
 };
 
-// --- Lớp cho kết nối TLS ---
 class TlsClient : public IClientConnection {
 private:
     int fd_;
@@ -78,69 +72,58 @@ private:
 public:
     TlsClient(int fd, SSL* ssl) : fd_(fd), ssl_(ssl) {}
     ~TlsClient() override { close_connection(); }
-
     int get_fd() const override { return fd_; }
-
-    ssize_t read(char* buffer, size_t size) override {
-        return SSL_read(ssl_, buffer, size);
-    }
-    
+    ssize_t read(char* buffer, size_t size) override { return SSL_read(ssl_, buffer, size); }
     void close_connection() override {
-        if (ssl_) {
-            SSL_shutdown(ssl_);
-            SSL_free(ssl_);
-            ssl_ = nullptr;
-        }
-        if (fd_ != -1) {
-            close(fd_);
-            fd_ = -1;
-        }
+        if (ssl_) { SSL_shutdown(ssl_); SSL_free(ssl_); ssl_ = nullptr; }
+        if (fd_ != -1) { close(fd_); fd_ = -1; }
     }
     std::string get_type() const override { return "TLS"; }
 };
 
-
-// ... Các struct PacketInfo và ClientState giữ nguyên, nhưng ClientState sẽ thay đổi ...
+//========================================================
+// STRUCTS VÀ HÀM HELPER
+//========================================================
 struct PacketInfo {
     pcap_pkthdr header;
     std::vector<unsigned char> data;
 };
 
+// *** CẬP NHẬT CLIENTSTATE VÀ FSM ***
 struct ClientState {
-    std::unique_ptr<IClientConnection> connection; // Thay thế int fd
+    std::unique_ptr<IClientConnection> connection;
     std::string ip_address;
     uint16_t port;
     std::vector<PacketInfo> buffered_packets;
     size_t current_total_bytes;
+    size_t total_bytes;
     long long current_total_packets;
+    long long total_packets; 
     std::vector<char> recv_buffer;
 
     enum class ReceiveFSM {
         AWAITING_METADATA_LINKTYPE,
-        AWAITING_PCAP_FIELDS_HEADER,
-        AWAITING_PCAP_DATA
+        AWAITING_BLOCK_HEADER,
+        AWAITING_BLOCK_PAYLOAD
     };
     ReceiveFSM current_fsm_state;
     
     int datalink_type;
-    uint32_t expected_pcap_ts_sec;
-    uint32_t expected_pcap_ts_usec;
-    uint32_t expected_pcap_caplen;
-    uint32_t expected_pcap_len;
 
-    ClientState() : 
-        connection(nullptr),
-        current_total_packets(0),
-        current_total_bytes(0), 
-        current_fsm_state(ReceiveFSM::AWAITING_METADATA_LINKTYPE),
-        datalink_type(DLT_NULL)
-    {}
+    // Các trường mới để xử lý block
+    uint8_t expected_flags;
+    uint32_t expected_original_size;
+    uint32_t expected_payload_size;
+    std::vector<char> decompressed_buffer; // Buffer để giải nén
 
-    // Constructor để di chuyển (move) connection vào
+    ClientState() = delete; // Xóa constructor mặc định để tránh lỗi
+
     ClientState(std::unique_ptr<IClientConnection> conn, std::string ip, uint16_t p)
         : connection(std::move(conn)), ip_address(std::move(ip)), port(p),
-          current_total_packets(0), current_total_bytes(0), 
-          current_fsm_state(ReceiveFSM::AWAITING_METADATA_LINKTYPE), datalink_type(DLT_NULL)
+          current_total_bytes(0), current_total_packets(0), total_packets(0), total_bytes(0),
+          current_fsm_state(ReceiveFSM::AWAITING_METADATA_LINKTYPE),
+          datalink_type(DLT_NULL), expected_flags(0),
+          expected_original_size(0), expected_payload_size(0)
     {}
 };
 
@@ -159,10 +142,18 @@ void save_packets_to_pcap(ClientState& client) {
         return;
     }
 
+    client.total_bytes += client.current_total_bytes;
+    client.total_packets += client.current_total_packets;
+
     std::string filename = generate_pcap_filename(client.ip_address, client.port);
-    std::cout << "Server: Saving " << client.current_total_bytes << " bytes, " << client.current_total_packets << " packets for client "
-              << client.ip_address << ":" << client.port 
-              << " (Datalink: " << client.datalink_type << " - " << pcap_datalink_val_to_name(client.datalink_type) << ") to " << filename << std::endl;
+    std::cout << std::fixed << std::setprecision(2); 
+
+    std::cout << "Server: Saving " 
+            << static_cast<double>(client.current_total_bytes) / (1024 * 1024) << " MB, "
+            << client.current_total_packets << " packets for client "
+            << client.ip_address << ":" << client.port << std::endl;
+
+            //   << " (Datalink: " << client.datalink_type << " - " << pcap_datalink_val_to_name(client.datalink_type) << ") to " << filename << std::endl;
 
     pcap_t* pcap_handle_write = pcap_open_dead(client.datalink_type, 65535); 
     if (!pcap_handle_write) {
@@ -170,18 +161,18 @@ void save_packets_to_pcap(ClientState& client) {
         return;
     }
 
-    pcap_dumper_t* dumper = pcap_dump_open(pcap_handle_write, filename.c_str());
-    if (!dumper) {
-        std::cerr << "Server Error: pcap_dump_open failed: " << pcap_geterr(pcap_handle_write) << std::endl;
-        pcap_close(pcap_handle_write);
-        return;
-    }
+    // pcap_dumper_t* dumper = pcap_dump_open(pcap_handle_write, filename.c_str());
+    // if (!dumper) {
+    //     std::cerr << "Server Error: pcap_dump_open failed: " << pcap_geterr(pcap_handle_write) << std::endl;
+    //     pcap_close(pcap_handle_write);
+    //     return;
+    // }
 
-    for (const auto& pkt_info : client.buffered_packets) {
-        pcap_dump(reinterpret_cast<u_char*>(dumper), &pkt_info.header, pkt_info.data.data());
-    }
+    // for (const auto& pkt_info : client.buffered_packets) {
+    //     pcap_dump(reinterpret_cast<u_char*>(dumper), &pkt_info.header, pkt_info.data.data());
+    // }
 
-    pcap_dump_close(dumper);
+    // pcap_dump_close(dumper);
 
     pcap_close(pcap_handle_write);
 
@@ -192,9 +183,7 @@ void save_packets_to_pcap(ClientState& client) {
     client.current_total_packets = 0;
 }
 
-//========================================================
-// HÀM HELPER CHO TLS
-//========================================================
+// Các hàm TLS (create_ssl_context, configure_ssl_context) không đổi
 SSL_CTX* create_ssl_context() {
     const SSL_METHOD *method;
     SSL_CTX *ctx;
@@ -252,30 +241,27 @@ int create_listening_socket(int port) {
     return sock;
 }
 
-
 //========================================================
 // MAIN FUNCTION
 //========================================================
 int main() {
-    // --- Khởi tạo Socket thường ---
+    // --- Khởi tạo Socket thường và TLS (không đổi) ---
     int tcp_server_sock = create_listening_socket(PLAIN_TCP_PORT);
     if (tcp_server_sock < 0) return 1;
     std::cout << "Server listening for PLAIN TCP on port " << PLAIN_TCP_PORT << "..." << std::endl;
 
-    // --- Khởi tạo Socket TLS ---
     SSL_CTX *ssl_ctx = create_ssl_context();
     configure_ssl_context(ssl_ctx);
     int tls_server_sock = create_listening_socket(TLS_PORT);
     if (tls_server_sock < 0) return 1;
     std::cout << "Server listening for TLS on port " << TLS_PORT << "..." << std::endl;
 
-
+    // --- Vòng lặp select (không đổi) ---
     fd_set master_fds, read_fds;
     FD_ZERO(&master_fds);
     FD_SET(tcp_server_sock, &master_fds);
     FD_SET(tls_server_sock, &master_fds);
     int fd_max = std::max(tcp_server_sock, tls_server_sock);
-
     std::map<int, ClientState> clients_state;
 
     while (true) {
@@ -289,7 +275,7 @@ int main() {
         for (int i = 0; i <= fd_max; ++i) {
             if (!FD_ISSET(i, &read_fds)) continue;
 
-            // --- XỬ LÝ KẾT NỐI MỚI ---
+            // --- Xử lý kết nối mới (không đổi) ---
             if (i == tcp_server_sock || i == tls_server_sock) {
                 sockaddr_in client_addr{};
                 socklen_t client_len = sizeof(client_addr);
@@ -325,27 +311,28 @@ int main() {
                 clients_state.emplace(client_sock,
                     ClientState(std::move(new_connection), std::string(client_ip), client_port)
                 );
-
             }
-            // --- XỬ LÝ DỮ LIỆU TỪ CLIENT ---
+            // --- XỬ LÝ DỮ LIỆU TỪ CLIENT (PHẦN THAY ĐỔI CHÍNH) ---
             else {
                 int client_fd = i;
                 auto it = clients_state.find(client_fd);
-                if (it == clients_state.end()) continue; // Should not happen
+                if (it == clients_state.end()) continue;
 
                 ClientState& client = it->second;
                 char temp_buf[8192];
                 
-                // Dùng phương thức read() của interface
                 ssize_t nbytes = client.connection->read(temp_buf, sizeof(temp_buf));
 
                 if (nbytes <= 0) {
                     // Xử lý ngắt kết nối
-                     std::cout << "Server: Client " << client.ip_address << ":" << client.port
+                    std::cout << "Server: Client " << client.ip_address << ":" << client.port
                                       << " (socket " << client_fd << ") disconnected." << std::endl;
                     if (!client.buffered_packets.empty()) {
                          save_packets_to_pcap(client);
                     }
+                    std::cout << "Server: Received " 
+                            << static_cast<double>(client.total_bytes) / (1024 * 1024) << " MB, "
+                            << client.total_packets << " packets for client!!!" << std::endl;
                     // Destructor của ClientState sẽ tự động gọi connection->close_connection()
                     FD_CLR(client_fd, &master_fds);
                     clients_state.erase(it);
@@ -355,7 +342,7 @@ int main() {
                         }
                     }
                 } else {
-                    // Xử lý dữ liệu nhận được (logic FSM giữ nguyên)
+                    // --- LOGIC FSM MỚI ĐỂ XỬ LÝ BLOCK ---
                     client.recv_buffer.insert(client.recv_buffer.end(), temp_buf, temp_buf + nbytes);
                     
                     bool processed_data_in_this_pass;
@@ -368,47 +355,108 @@ int main() {
                                     memcpy(&link_type_net, client.recv_buffer.data(), METADATA_SIZE_LINKTYPE);
                                     client.datalink_type = static_cast<int>(ntohl(link_type_net));
                                     client.recv_buffer.erase(client.recv_buffer.begin(), client.recv_buffer.begin() + METADATA_SIZE_LINKTYPE);
-                                    client.current_fsm_state = ClientState::ReceiveFSM::AWAITING_PCAP_FIELDS_HEADER;
-                                    processed_data_in_this_pass = true;
-                                    std::cout << "Server: Socket " << client_fd << " received Datalink: " << client.datalink_type << " (" << pcap_datalink_val_to_name(client.datalink_type) << ")." << std::endl;
-                                }
-                                break;
-                            case ClientState::ReceiveFSM::AWAITING_PCAP_FIELDS_HEADER:
-                                if (client.recv_buffer.size() >= PCAP_FIELDS_HEADER_SIZE) {
-                                    // ... logic parse header giữ nguyên ...
-                                    const char* buf_ptr = client.recv_buffer.data();
-                                    uint32_t ts_sec_net, ts_usec_net, caplen_net, len_net;
-                                    memcpy(&ts_sec_net, buf_ptr, sizeof(uint32_t)); buf_ptr += sizeof(uint32_t);
-                                    memcpy(&ts_usec_net, buf_ptr, sizeof(uint32_t)); buf_ptr += sizeof(uint32_t);
-                                    memcpy(&caplen_net, buf_ptr, sizeof(uint32_t)); buf_ptr += sizeof(uint32_t);
-                                    memcpy(&len_net, buf_ptr, sizeof(uint32_t));
-                                    client.expected_pcap_ts_sec = ntohl(ts_sec_net);
-                                    client.expected_pcap_ts_usec = ntohl(ts_usec_net);
-                                    client.expected_pcap_caplen = ntohl(caplen_net);
-                                    client.expected_pcap_len = ntohl(len_net);
-                                    client.recv_buffer.erase(client.recv_buffer.begin(), client.recv_buffer.begin() + PCAP_FIELDS_HEADER_SIZE);
                                     
-                                    if (client.expected_pcap_caplen > 65535 * 2) { /* error handling */ } else {
-                                        client.current_fsm_state = ClientState::ReceiveFSM::AWAITING_PCAP_DATA;
-                                    }
+                                    // Chuyển sang trạng thái chờ block header
+                                    client.current_fsm_state = ClientState::ReceiveFSM::AWAITING_BLOCK_HEADER;
+                                    processed_data_in_this_pass = true;
+
+                                    std::cout << "Server: Socket " << client_fd << " received Datalink: " << client.datalink_type 
+                                              << " (" << pcap_datalink_val_to_name(client.datalink_type) << ")." << std::endl;
+                                }
+                                break;
+                            
+                            case ClientState::ReceiveFSM::AWAITING_BLOCK_HEADER:
+                                if (client.recv_buffer.size() >= BLOCK_HEADER_SIZE) {
+                                    const char* buf_ptr = client.recv_buffer.data();
+
+                                    memcpy(&client.expected_flags, buf_ptr, sizeof(uint8_t));
+                                    buf_ptr += sizeof(uint8_t);
+                                    
+                                    uint32_t original_size_net, payload_size_net;
+                                    memcpy(&original_size_net, buf_ptr, sizeof(uint32_t));
+                                    buf_ptr += sizeof(uint32_t);
+                                    memcpy(&payload_size_net, buf_ptr, sizeof(uint32_t));
+
+                                    client.expected_original_size = ntohl(original_size_net);
+                                    client.expected_payload_size = ntohl(payload_size_net);
+
+                                    client.recv_buffer.erase(client.recv_buffer.begin(), client.recv_buffer.begin() + BLOCK_HEADER_SIZE);
+                                    
+                                    client.current_fsm_state = ClientState::ReceiveFSM::AWAITING_BLOCK_PAYLOAD;
                                     processed_data_in_this_pass = true;
                                 }
                                 break;
-                            case ClientState::ReceiveFSM::AWAITING_PCAP_DATA:
-                                if (client.recv_buffer.size() >= client.expected_pcap_caplen) {
-                                    // ... logic xử lý data packet giữ nguyên ...
-                                    PacketInfo pkt;
-                                    pkt.header.ts.tv_sec = client.expected_pcap_ts_sec;
-                                    pkt.header.ts.tv_usec = client.expected_pcap_ts_usec;
-                                    pkt.header.caplen = client.expected_pcap_caplen;
-                                    pkt.header.len = client.expected_pcap_len;
-                                    pkt.data.assign(client.recv_buffer.begin(), client.recv_buffer.begin() + client.expected_pcap_caplen);
-                                    client.buffered_packets.push_back(pkt);
-                                    client.current_total_bytes += client.expected_pcap_caplen;
-                                    client.current_total_packets++;
-                                    client.recv_buffer.erase(client.recv_buffer.begin(), client.recv_buffer.begin() + client.expected_pcap_caplen);
-                                    client.current_fsm_state = ClientState::ReceiveFSM::AWAITING_PCAP_FIELDS_HEADER;
+                            
+                            case ClientState::ReceiveFSM::AWAITING_BLOCK_PAYLOAD:
+                                if (client.recv_buffer.size() >= client.expected_payload_size) {
+                                    const char* payload_start = client.recv_buffer.data();
+                                    const char* data_to_process = nullptr;
+                                    size_t data_to_process_size = 0;
+
+                                    bool is_compressed = (client.expected_flags & FLAG_COMPRESSED_ZSTD);
+                                    if (is_compressed) {
+                                        client.decompressed_buffer.resize(client.expected_original_size);
+                                        
+                                        size_t const decompressed_size = ZSTD_decompress(
+                                            client.decompressed_buffer.data(), client.expected_original_size,
+                                            payload_start, client.expected_payload_size
+                                        );
+
+                                        if (ZSTD_isError(decompressed_size) || decompressed_size != client.expected_original_size) {
+                                            std::cerr << "ZSTD decompression failed for socket " << client_fd << ". Discarding block." << std::endl;
+                                        } else {
+                                            data_to_process = client.decompressed_buffer.data();
+                                            data_to_process_size = decompressed_size;
+                                        }
+                                    } else {
+                                        data_to_process = payload_start;
+                                        data_to_process_size = client.expected_payload_size;
+                                    }
+
+                                    // Vòng lặp xử lý các gói tin bên trong block
+                                    if (data_to_process != nullptr && data_to_process_size > 0) {
+                                        const char* packet_ptr = data_to_process;
+                                        size_t remaining_size = data_to_process_size;
+
+                                        while (remaining_size >= PCAP_FIELDS_HEADER_SIZE) {
+                                            uint32_t ts_sec_net, ts_usec_net, caplen_net, len_net;
+                                            memcpy(&ts_sec_net, packet_ptr, sizeof(uint32_t));
+                                            memcpy(&ts_usec_net, packet_ptr + 4, sizeof(uint32_t));
+                                            memcpy(&caplen_net, packet_ptr + 8, sizeof(uint32_t));
+                                            memcpy(&len_net, packet_ptr + 12, sizeof(uint32_t));
+                                            
+                                            packet_ptr += PCAP_FIELDS_HEADER_SIZE;
+                                            remaining_size -= PCAP_FIELDS_HEADER_SIZE;
+                                            
+                                            uint32_t caplen = ntohl(caplen_net);
+                                            if (remaining_size < caplen) {
+                                                std::cerr << "Corrupted block data for socket " << client_fd << ". Not enough data for packet. Expected " << caplen << ", have " << remaining_size << std::endl;
+                                                break;
+                                            }
+
+                                            PacketInfo pkt;
+                                            pkt.header.ts.tv_sec = ntohl(ts_sec_net);
+                                            pkt.header.ts.tv_usec = ntohl(ts_usec_net);
+                                            pkt.header.caplen = caplen;
+                                            pkt.header.len = ntohl(len_net);
+                                            pkt.data.assign(reinterpret_cast<const unsigned char*>(packet_ptr), reinterpret_cast<const unsigned char*>(packet_ptr) + caplen);
+                                            
+                                            client.buffered_packets.push_back(std::move(pkt));
+                                            client.current_total_bytes += caplen;
+                                            client.current_total_packets++;
+
+                                            packet_ptr += caplen;
+                                            remaining_size -= caplen;
+                                        }
+                                    }
+                                    
+                                    // Xóa payload đã xử lý khỏi buffer nhận
+                                    client.recv_buffer.erase(client.recv_buffer.begin(), client.recv_buffer.begin() + client.expected_payload_size);
+
+                                    // Quay lại chờ header của block tiếp theo
+                                    client.current_fsm_state = ClientState::ReceiveFSM::AWAITING_BLOCK_HEADER;
                                     processed_data_in_this_pass = true;
+
                                     if (client.current_total_bytes >= MAX_BUFFER_SIZE_PER_CLIENT) {
                                         save_packets_to_pcap(client);
                                     }
@@ -421,6 +469,7 @@ int main() {
         }
     }
 
+    // --- Shutdown (không đổi) ---
     std::cout << "Server shutting down. Saving remaining packets..." << std::endl;
     for (auto& pair : clients_state) {
         if (!pair.second.buffered_packets.empty()) {
@@ -429,11 +478,10 @@ int main() {
         // Destructor sẽ tự động đóng kết nối
     }
     clients_state.clear();
-
     if (ssl_ctx) SSL_CTX_free(ssl_ctx);
     close(tcp_server_sock);
     close(tls_server_sock);
-
     std::cout << "Server shutdown complete." << std::endl;
+
     return 0;
 }
