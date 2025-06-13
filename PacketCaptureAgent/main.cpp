@@ -535,6 +535,37 @@ void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppCo
 }
 
 
+struct SendLogEntry {
+    size_t packet_count;
+    size_t original_size;
+    size_t compressed_size;
+    std::chrono::steady_clock::time_point send_start_time;
+    std::chrono::steady_clock::time_point send_end_time;
+};
+std::vector<SendLogEntry> send_logs;
+std::mutex send_log_mutex;
+
+void save_send_logs_to_file(const std::string& filename) {
+    std::ofstream log_file(filename);
+    if (!log_file.is_open()) {
+        std::cerr << "Failed to open log file: " << filename << std::endl;
+        return;
+    }
+
+    log_file << "packet_count,original_size,compressed_size,send_duration_us\n";
+    for (const auto& entry : send_logs) {
+        auto duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+            entry.send_end_time - entry.send_start_time).count();
+
+        log_file << entry.packet_count << ","
+                 << entry.original_size << ","
+                 << entry.compressed_size << ","
+                 << duration_ms << "\n";
+    }
+
+    log_file.close();
+}
+
 void sender_thread_func(IConnection& connection, IDataProcessor& processor, const AppConfig& config, BoundedThreadSafeQueue<PacketBlock>& queue) {
     std::cout << "Sender thread started." << std::endl;
 
@@ -550,11 +581,31 @@ void sender_thread_func(IConnection& connection, IDataProcessor& processor, cons
     while (true) {
         if (!queue.pop(block_to_send)) break;
 
+        auto send_start_time = std::chrono::steady_clock::now();        
         // 1. Serialize dữ liệu vào buffer như cũ
         serialization_buffer.clear();
         for (const auto& packet : block_to_send) {
-            uint32_t ts_sec_net = htonl(static_cast<uint32_t>(packet.header.ts.tv_sec));
-            uint32_t ts_usec_net = htonl(static_cast<uint32_t>(packet.header.ts.tv_usec));
+
+        // ------------------ TEST LATENCY ------------------------
+            // Lấy thời gian hiện tại (theo epoch, micro giây)
+            std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+            std::chrono::microseconds us_since_epoch = std::chrono::duration_cast<std::chrono::microseconds>(
+                now.time_since_epoch()
+            );
+
+            uint64_t send_ts_us = us_since_epoch.count();
+
+            // Nếu bạn vẫn cần ts_sec và ts_usec tách riêng như PCAP:
+            uint32_t ts_sec = static_cast<uint32_t>(send_ts_us / 1000000);
+            uint32_t ts_usec = static_cast<uint32_t>(send_ts_us % 1000000);
+
+            uint32_t ts_sec_net = htonl(ts_sec);
+            uint32_t ts_usec_net = htonl(ts_usec);
+        // ----------------------------------------------
+
+
+            // uint32_t ts_sec_net = htonl(static_cast<uint32_t>(packet.header.ts.tv_sec));
+            // uint32_t ts_usec_net = htonl(static_cast<uint32_t>(packet.header.ts.tv_usec));
             uint32_t caplen_net = htonl(packet.header.caplen);
             uint32_t len_net = htonl(packet.header.len);
 
@@ -591,11 +642,6 @@ void sender_thread_func(IConnection& connection, IDataProcessor& processor, cons
             uint32_t original_size_net = htonl(original_size);
             uint32_t payload_size_net = htonl(payload_size);
 
-            std::cout << "Compression ratio: " 
-                    << std::fixed << std::setprecision(2)
-                    << static_cast<double>(original_size) / payload_size
-                    << std::endl;
-
             // Chuẩn bị buffer cuối cùng để gửi đi
             final_send_buffer.clear();
             final_send_buffer.resize(BLOCK_HEADER_SIZE + processed_payload.size());
@@ -613,13 +659,27 @@ void sender_thread_func(IConnection& connection, IDataProcessor& processor, cons
             // Ghi payload
             memcpy(ptr, processed_payload.data(), processed_payload.size());
 
-            // 4. Gửi block cuối cùng đi
-            if (!connection.send_data(final_send_buffer.data(), final_send_buffer.size())) {
+
+            bool sent_success = connection.send_data(final_send_buffer.data(), final_send_buffer.size());
+            auto send_end_time = std::chrono::steady_clock::now();
+
+            if (!sent_success) {
                 std::cerr << "Failed to send data block to server. Stopping." << std::endl;
                 capture_interrupted = true;
                 queue.shutdown();
                 break;
             }
+
+            {
+                std::lock_guard<std::mutex> lock(send_log_mutex);
+                send_logs.push_back(SendLogEntry{
+                    block_to_send.size(),
+                    original_size,
+                    payload_size,
+                    send_start_time,
+                    send_end_time
+                });
+            }            
 
             total_bytes_sent_local += final_send_buffer.size();
             total_packets_sent_local += block_to_send.size();
@@ -801,6 +861,8 @@ int main() {
         }
         global_pcap_handles.clear();
     }    
+
+    save_send_logs_to_file("/home/maimanh/Downloads/Code/VDT/Project/test/agent/send_log.csv");
     
     std::cout << "Agent: Exiting." << std::endl;
     return 0;

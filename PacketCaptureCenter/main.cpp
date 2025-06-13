@@ -7,7 +7,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <memory> // For std::unique_ptr
-
+#include <chrono>
 // System headers
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -16,6 +16,8 @@
 #include <fcntl.h>
 #include <cerrno>
 #include <sys/time.h>
+#include <fstream>
+#include <atomic>
 
 // Pcap headers
 #include <pcap/pcap.h>
@@ -23,7 +25,7 @@
 // OpenSSL headers
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-
+#include <csignal> // Thêm dòng này
 // Zstandard header
 #include <zstd.h> // *** THÊM THƯ VIỆN ZSTD ***
 
@@ -302,11 +304,35 @@ public:
     }
 };
 
+// Khai báo global hoặc trong một class quản lý
+std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> latency_log_entries;
+void flush_latency_log_to_csv(const std::string& filename = "/home/maimanh/Downloads/Code/VDT/Project/test/center/latency_log.csv") {
+    std::ofstream ofs(filename);
+    std::cout << "Open File successfully\n";
+    ofs << "send_timestamp_us,recv_timestamp_us,latency_us\n";
+    for (const auto& [send_us, recv_us, latency_us] : latency_log_entries) {
+        ofs << send_us << "," << recv_us << "," << latency_us << "\n";
+    }
+}
+
+
+// ----------- Interupt -----------------
+std::atomic<bool> server_interrupted(false);
+void signal_handler(int signum) {
+    std::cout << "\nSignal " << signum << " received. Shutting down..." << std::endl;
+    server_interrupted = true;
+}
+
+
+
 //========================================================
 // MAIN FUNCTION
 //========================================================
 int main() {
-        fprintf(stderr, ">>> sizeof(pcap_pkthdr) = %zu bytes\n", sizeof(pcap_pkthdr));
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    fprintf(stderr, ">>> sizeof(pcap_pkthdr) = %zu bytes\n", sizeof(pcap_pkthdr));
     // --- Khởi tạo Socket thường và TLS (không đổi) ---
     int tcp_server_sock = create_listening_socket(PLAIN_TCP_PORT);
     if (tcp_server_sock < 0) return 1;
@@ -330,7 +356,7 @@ int main() {
     const std::string live_pipe_path = "/tmp/live_stream.pcap";
     bool streamer_initialized = false;    
 
-    while (true) {
+    while (!server_interrupted) {
         read_fds = master_fds;
         if (select(fd_max + 1, &read_fds, nullptr, nullptr, nullptr) < 0) {
             if (errno == EINTR) continue;
@@ -524,15 +550,25 @@ int main() {
                                             pkt.header.len = ntohl(len_net);
                                             pkt.data.assign(reinterpret_cast<const unsigned char*>(packet_ptr), reinterpret_cast<const unsigned char*>(packet_ptr) + caplen);
 
-    fprintf(stderr, "[DEBUG-FSM] Parsed Packet: ts=%u.%06u, caplen=%u, len=%u\n",
-            (unsigned int)pkt.header.ts.tv_sec,
-            (unsigned int)pkt.header.ts.tv_usec,
-            pkt.header.caplen,
-            pkt.header.len);                                            
-
                                             if (live_streamer.is_open()) {
                                                 live_streamer.write_packet(&pkt.header, pkt.data.data());
-                                            }                                            
+                                            }     
+                                            
+                                            uint32_t ts_sec = ntohl(ts_sec_net);
+                                            uint32_t ts_usec = ntohl(ts_usec_net);
+
+                                            // Phục hồi lại thời gian gửi (us)
+                                            uint64_t send_ts_us = static_cast<uint64_t>(ts_sec) * 1'000'000 + ts_usec;
+
+                                            auto now = std::chrono::system_clock::now();
+                                            uint64_t recv_ts_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+
+                                            uint64_t latency_us = recv_ts_us - send_ts_us;
+                                            // std::cout << "Latency: " << latency_us << " us" << std::endl;
+
+                                            // Lưu vào vector
+                                            latency_log_entries.emplace_back(send_ts_us, recv_ts_us, latency_us);                                            
+                                            
 
                                             client.buffered_packets.push_back(std::move(pkt));
                                             client.current_total_bytes += caplen;
@@ -545,6 +581,7 @@ int main() {
                                     
                                     // Xóa payload đã xử lý khỏi buffer nhận
                                     client.recv_buffer.erase(client.recv_buffer.begin(), client.recv_buffer.begin() + client.expected_payload_size);
+
 
                                     // Quay lại chờ header của block tiếp theo
                                     client.current_fsm_state = ClientState::ReceiveFSM::AWAITING_BLOCK_HEADER;
@@ -561,6 +598,8 @@ int main() {
             }
         }
     }
+
+    flush_latency_log_to_csv();
 
     // --- Shutdown (không đổi) ---
     std::cout << "Server shutting down. Saving remaining packets..." << std::endl;
