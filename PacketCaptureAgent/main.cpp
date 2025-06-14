@@ -1,6 +1,7 @@
 #include "connection/PlainTcpConnection.hpp"
 #include "connection/TlsConnection.hpp"
 #include "processor/ZstdProcessor.hpp"
+#include "processor/ZlibProcessor.hpp"
 #include "processor/PassThroughProcessor.hpp"
 #include "utils/config_utils.hpp"
 #include "concurrent/bounded_queue.hpp"
@@ -32,8 +33,9 @@
 #include <openssl/err.h>
 
 const uint8_t FLAG_COMPRESSED_ZSTD = (1 << 0); // Bit 0 cho cờ nén ZSTD
-const size_t BLOCK_HEADER_SIZE = sizeof(uint8_t) + sizeof(uint32_t) + sizeof(uint32_t);
+const uint8_t FLAG_COMPRESSED_ZLIB = (1 << 1); // Bit 1: Zlib
 
+const size_t BLOCK_HEADER_SIZE = sizeof(uint8_t) + sizeof(uint32_t) + sizeof(uint32_t);
 
 // --- Biến toàn cục ---
 std::atomic<bool> capture_interrupted(false);
@@ -65,9 +67,12 @@ std::unique_ptr<IConnection> create_connection(const AppConfig& config) {
 
 // --- Factory để tạo ra đối tượng Processor phù hợp ---
 std::unique_ptr<IDataProcessor> create_processor(const AppConfig& config) {
-    if (config.compressed) {
+    if (config.compression == CompressionType::ZSTD) {
         std::cout << "Data processing enabled: Zstandard Compression" << std::endl;
         return std::make_unique<ZstdProcessor>();
+    } else if (config.compression == CompressionType::ZLIB) {
+        std::cout << "Data processing enabled: Zlib Compression" << std::endl;
+        return std::make_unique<ZlibProcessor>();
     } else {
         std::cout << "Data processing disabled: Pass-through" << std::endl;
         return std::make_unique<PassThroughProcessor>();
@@ -203,15 +208,19 @@ void sender_thread_func(IConnection& connection, IDataProcessor& processor, cons
         std::vector<char> processed_payload = processor.process(serialization_buffer);
         auto processing_end_time = std::chrono::steady_clock::now();
 
-        if (processed_payload.empty() && config.compressed) {
+        if (processed_payload.empty() && config.compression != CompressionType::NONE) {
             std::cerr << "Compression failed, skipping block." << std::endl;
             continue;
         }
 
         uint8_t flags = 0;
-        if (config.compressed) {
+
+        if (config.compression == CompressionType::ZSTD) {
             flags |= FLAG_COMPRESSED_ZSTD;
+        } else if (config.compression == CompressionType::ZLIB) {
+            flags |= FLAG_COMPRESSED_ZLIB;
         }
+
         uint32_t original_size = static_cast<uint32_t>(serialization_buffer.size());
         uint32_t payload_size = static_cast<uint32_t>(processed_payload.size());
         uint32_t original_size_net = htonl(original_size);

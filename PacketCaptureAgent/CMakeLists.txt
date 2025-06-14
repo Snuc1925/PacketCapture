@@ -36,6 +36,9 @@ if(NOT ZSTD_LIBRARY OR NOT ZSTD_INCLUDE_DIR)
     message(FATAL_ERROR "Zstd not found. Install with: sudo apt install libzstd-dev")
 endif()
 
+# === Tìm zlib =========
+find_package(ZLIB REQUIRED)
+
 # === Tìm OpenSSL & Threads ===
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
@@ -47,6 +50,7 @@ set(SOURCE_FILES
     src/connection/TlsConnection.cpp
     src/processor/PassThroughProcessor.cpp
     src/processor/ZstdProcessor.cpp
+    src/processor/ZlibProcessor.cpp
     src/utils/config_utils.cpp
     src/logging/send_log.cpp
 )
@@ -61,6 +65,7 @@ target_include_directories(PacketCaptureAgent PRIVATE
     ${OpenSSL_INCLUDE_DIRS}
     ${UDT_INCLUDE_DIR}
     ${ZSTD_INCLUDE_DIR}
+    ${ZLIB_INCLUDE_DIRS}
 )
 
 # === Link các thư viện ===
@@ -68,6 +73,7 @@ target_link_libraries(PacketCaptureAgent
     ${PCAP_LIBRARY}
     ${UDT_LIBRARY}
     ${ZSTD_LIBRARY}
+    ${ZLIB_LIBRARIES}
     Threads::Threads
     OpenSSL::SSL
     OpenSSL::Crypto

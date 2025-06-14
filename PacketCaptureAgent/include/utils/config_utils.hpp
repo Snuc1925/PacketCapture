@@ -3,6 +3,12 @@
 #include <string>
 #include <vector>
 
+enum class CompressionType {
+    NONE,
+    ZSTD,
+    ZLIB
+};
+
 struct AppConfig {
     std::string server_ip = "127.0.0.1";
     int server_port = 8888;
@@ -13,6 +19,7 @@ struct AppConfig {
     int send_buffer_size_kb = 4096;
     bool encrypt = false;
     bool compressed = false;
+    CompressionType compression = CompressionType::NONE;
 };
 
 struct TrafficFilter {
