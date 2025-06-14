@@ -1,3 +1,10 @@
+#include "connection/PlainTcpConnection.hpp"
+#include "connection/TlsConnection.hpp"
+#include "processor/ZstdProcessor.hpp"
+#include "processor/PassThroughProcessor.hpp"
+#include "utils/config_utils.hpp"
+#include "concurrent/bounded_queue.hpp"
+#include "logging/send_log.hpp"
 #include <iostream>
 #include <vector>
 #include <string>
@@ -21,34 +28,13 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <zstd.h> 
-// OpenSSL headers (cần cho TLS)
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
 const uint8_t FLAG_COMPRESSED_ZSTD = (1 << 0); // Bit 0 cho cờ nén ZSTD
 const size_t BLOCK_HEADER_SIZE = sizeof(uint8_t) + sizeof(uint32_t) + sizeof(uint32_t);
 
-// --- Cấu trúc để chứa toàn bộ cấu hình ---
-struct AppConfig {
-    std::string server_ip = "127.0.0.1";
-    int server_port = 8888;
-    std::vector<std::string> interfaces;
-    int pcap_buffer_size_mb = 32;
-    int batch_packet_count = 256;
-    size_t max_queue_blocks = 1024;
-    int send_buffer_size_kb = 4096;
-    bool encrypt = false; // Thêm cấu hình mã hóa
-    bool compressed = false;
-};
 
-struct TrafficFilter {
-    std::string ip_src;
-    std::string ip_dst;
-    std::string port;
-    std::string protocol;
-};
-
-// ... Các phần khác như BoundedThreadSafeQueue, CapturedPacket giữ nguyên ...
 // --- Biến toàn cục ---
 std::atomic<bool> capture_interrupted(false);
 std::atomic<long long> total_bytes_sent(0);
@@ -66,216 +52,7 @@ struct CapturedPacket {
 };
 using PacketBlock = std::vector<CapturedPacket>;
 
-// --- Hàng đợi an toàn CÓ GIỚI HẠN (Bounded Thread-Safe Queue) ---
-template<typename T>
-class BoundedThreadSafeQueue {
-private:
-    std::queue<T> queue_;
-    mutable std::mutex mutex_;
-    std::condition_variable cond_not_full_;
-    std::condition_variable cond_not_empty_;
-    size_t max_size_;
-    std::atomic<bool> shutdown_ = {false};
-
-public:
-    explicit BoundedThreadSafeQueue(size_t max_size) : max_size_(max_size) {}
-
-    void push(T item) {
-        if (shutdown_) return;
-        std::unique_lock<std::mutex> lock(mutex_);
-        cond_not_full_.wait(lock, [this] { return queue_.size() < max_size_ || shutdown_; });
-        if (shutdown_) return;
-        
-        queue_.push(std::move(item));
-        lock.unlock();
-        cond_not_empty_.notify_one();
-    }
-
-    bool pop(T& item) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cond_not_empty_.wait(lock, [this] { return !queue_.empty() || shutdown_; });
-        if (shutdown_ && queue_.empty()) return false;
-        
-        item = std::move(queue_.front());
-        queue_.pop();
-        lock.unlock();
-        cond_not_full_.notify_one();
-        return true;
-    }
-
-    void shutdown() {
-        shutdown_ = true;
-        cond_not_full_.notify_all();
-        cond_not_empty_.notify_all();
-    }
-    
-    size_t size() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return queue_.size();
-    }
-};
-
-class IConnection {
-public:
-    virtual ~IConnection() = default; // Destructor ảo là BẮT BUỘC
-    virtual bool connect(const std::string& ip, int port) = 0;
-    virtual bool send_data(const void* buffer, size_t length) = 0;
-    virtual void disconnect() = 0;
-};
-
-
-// --- Lớp cho kết nối TCP thông thường (không mã hóa) ---
-class PlainTcpConnection : public IConnection {
-private:
-    int sockfd_ = -1;
-
-public:
-    ~PlainTcpConnection() override {
-        disconnect();
-    }
-
-    bool connect(const std::string& ip, int port) override {
-        sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
-
-        if (sockfd_ < 0) {
-            perror("Socket creation failed");
-            return false;
-        }
-
-        struct sockaddr_in serv_addr;
-        serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(port);
-        if (inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0) {
-            perror("Invalid address/ Address not supported");
-            return false;
-        }
-
-        if (::connect(sockfd_, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-            perror("Connect failed");
-            close(sockfd_);
-            sockfd_ = -1;
-            return false;
-        }
-        std::cout << "Connection strategy: Plain TCP" << std::endl;
-        return true;
-    }
-
-    bool send_data(const void* buffer, size_t length) override {
-        if (sockfd_ < 0) return false;
-        const char* ptr = static_cast<const char*>(buffer);
-        while (length > 0) {
-            ssize_t sent = send(sockfd_, ptr, length, MSG_NOSIGNAL);
-            if (sent <= 0) {
-                if (sent < 0 && errno == EINTR) continue;
-                std::cerr << "send_data error: " << strerror(errno) << std::endl;
-                return false;
-            }
-            ptr += sent;
-            length -= sent;
-        }
-        return true;
-    }
-
-    void disconnect() override {
-        if (sockfd_ != -1) {
-            close(sockfd_);
-            sockfd_ = -1;
-        }
-    }
-};
-
-class TlsConnection : public IConnection {
-private:
-    int sockfd_ = -1;
-    SSL_CTX* ctx_ = nullptr;
-    SSL* ssl_ = nullptr;
-
-    void init_openssl() {
-        SSL_load_error_strings();
-        OpenSSL_add_ssl_algorithms();
-    }
-
-    void cleanup_openssl() {
-        EVP_cleanup();
-    }
-
-    SSL_CTX* create_context() {
-        const SSL_METHOD *method = TLS_client_method();
-        SSL_CTX *ctx = SSL_CTX_new(method);
-        if (!ctx) {
-            perror("Unable to create SSL context");
-            ERR_print_errors_fp(stderr);
-            exit(EXIT_FAILURE);
-        }
-        return ctx;
-    }
-
-public:
-    TlsConnection() {
-        init_openssl();
-        ctx_ = create_context();
-    }
-
-    ~TlsConnection() override {
-        disconnect();
-        if (ctx_) {
-            SSL_CTX_free(ctx_);
-        }
-        cleanup_openssl();
-    }
-
-    bool connect(const std::string& ip, int port) override {
-        sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (sockfd_ < 0) { /* ... error handling ... */ return false; }
-        
-        struct sockaddr_in serv_addr;
-        serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(port);
-        inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr);
-
-        if (::connect(sockfd_, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-            perror("TCP connect failed for TLS");
-            return false;
-        }
-
-        ssl_ = SSL_new(ctx_);
-        SSL_set_fd(ssl_, sockfd_);
-
-        if (SSL_connect(ssl_) <= 0) {
-            ERR_print_errors_fp(stderr);
-            return false;
-        }
-        std::cout << "Connection strategy: TLS (OpenSSL)" << std::endl;
-        return true;
-    }
-
-    bool send_data(const void* buffer, size_t length) override {
-        if (!ssl_) return false;
-        
-        int bytes_sent = SSL_write(ssl_, buffer, length);
-        if (bytes_sent <= 0) {
-            int err = SSL_get_error(ssl_, bytes_sent);
-            std::cerr << "SSL_write failed with error code: " << err << std::endl;
-            ERR_print_errors_fp(stderr);
-            return false;
-        }
-        return true;
-    }
-
-    void disconnect() override {
-        if (ssl_) {
-            SSL_shutdown(ssl_);
-            SSL_free(ssl_);
-            ssl_ = nullptr;
-        }
-        if (sockfd_ != -1) {
-            close(sockfd_);
-            sockfd_ = -1;
-        }
-    }
-};
-
-
+// --- Factory để tạo ra đối tượng Connection phù hợp ---
 std::unique_ptr<IConnection> create_connection(const AppConfig& config) {
     if (config.encrypt) {
         std::cout << "TLS Connection!!!" << std::endl;
@@ -285,60 +62,6 @@ std::unique_ptr<IConnection> create_connection(const AppConfig& config) {
         std::cout << "PlainTCP Connection!!!" << std::endl;
     }
 }
-// ------------------------------------------------
-
-// ======================================================================================
-// *** PHẦN MỚI: INTERFACE VÀ CÁC LỚP XỬ LÝ DỮ LIỆU (NÉN) ***
-// ======================================================================================
-
-// --- Interface cho xử lý dữ liệu (nén, etc.) ---
-class IDataProcessor {
-public:
-    virtual ~IDataProcessor() = default;
-    // Xử lý một khối dữ liệu, trả về khối dữ liệu đã được xử lý
-    // Trả về một vector rỗng nếu có lỗi
-    virtual std::vector<char> process(const std::vector<char>& input_buffer) = 0;
-};
-
-// --- Lớp xử lý "không làm gì cả" (khi không nén) ---
-class PassThroughProcessor : public IDataProcessor {
-public:
-    std::vector<char> process(const std::vector<char>& input_buffer) override {
-        // Chỉ đơn giản là trả về buffer gốc
-        return input_buffer;
-    }
-};
-
-// --- Lớp xử lý nén dữ liệu bằng Zstandard ---
-class ZstdProcessor : public IDataProcessor {
-public:
-    std::vector<char> process(const std::vector<char>& input_buffer) override {
-        if (input_buffer.empty()) {
-            return {};
-        }
-
-        // Ước tính kích thước tối đa sau khi nén
-        size_t const compressed_bound = ZSTD_compressBound(input_buffer.size());
-        std::vector<char> compressed_buffer(compressed_bound);
-
-        // Nén dữ liệu
-        size_t const compressed_size = ZSTD_compress(
-            compressed_buffer.data(), compressed_buffer.size(),
-            input_buffer.data(), input_buffer.size(),
-            1 // Mức nén, 1 là nhanh nhất, có thể tăng lên (e.g., 3) để nén tốt hơn
-        );
-
-        // Kiểm tra lỗi
-        if (ZSTD_isError(compressed_size)) {
-            std::cerr << "ZSTD compression error: " << ZSTD_getErrorName(compressed_size) << std::endl;
-            return {}; // Trả về vector rỗng để báo lỗi
-        }
-
-        // Thay đổi kích thước vector về đúng kích thước đã nén
-        compressed_buffer.resize(compressed_size);
-        return compressed_buffer;
-    }
-};
 
 // --- Factory để tạo ra đối tượng Processor phù hợp ---
 std::unique_ptr<IDataProcessor> create_processor(const AppConfig& config) {
@@ -350,135 +73,23 @@ std::unique_ptr<IDataProcessor> create_processor(const AppConfig& config) {
         return std::make_unique<PassThroughProcessor>();
     }
 }
-// ======================================================================================
 
 
-
-std::string trim(const std::string& s) {
-    size_t first = s.find_first_not_of(" \t\n\r");
-    if (std::string::npos == first) return s;
-    size_t last = s.find_last_not_of(" \t\n\r");
-    return s.substr(first, (last - first + 1));
+// --- Signal Handler ---
+void signal_handler(int signum) {
+    std::cout << "\nSignal " << signum << " received. Shutting down..." << std::endl;
+    capture_interrupted = true;
+    std::lock_guard<std::mutex> lock(global_handles_mutex);
+    for (pcap_t* handle : global_pcap_handles) {
+        if (handle) pcap_breakloop(handle);
+    }
 }
 
-bool parse_config(const std::string& filename, AppConfig& config) {
-    std::ifstream config_file(filename);
-    if (!config_file.is_open()) {
-        std::cerr << "Error: Could not open config file: " << filename << std::endl;
-        return false;
-    }
-    std::string line;
-    while (std::getline(config_file, line)) {
-        line = trim(line);
-        if (line.empty() || line[0] == '#') continue;
 
-        std::stringstream ss(line);
-        std::string key, value;
-        if (std::getline(ss, key, '=')) {
-            std::getline(ss, value);
-            key = trim(key);
-            value = trim(value);
-
-            if (key == "server_ip") config.server_ip = value;
-            else if (key == "server_port") config.server_port = std::stoi(value);
-            else if (key == "pcap_buffer_size_mb") config.pcap_buffer_size_mb = std::stoi(value);
-            else if (key == "batch_packet_count") config.batch_packet_count = std::stoi(value);
-            else if (key == "max_queue_blocks") config.max_queue_blocks = std::stoul(value);
-            else if (key == "send_buffer_size_kb") config.send_buffer_size_kb = std::stoi(value);
-            else if (key == "encrypt") { // Xử lý cấu hình mới
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.encrypt = (value == "true");
-            }
-            else if (key == "interfaces") {
-                std::stringstream val_ss(value);
-                std::string interface;
-                while(std::getline(val_ss, interface, ',')) {
-                    interface = trim(interface);
-                    if (!interface.empty()) config.interfaces.push_back(interface);
-                }
-            } else if (key == "compressed") {
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.compressed = (value == "true");                
-            }
-        }
-    }
-
-    std::cout << "Loaded configuration:\n";
-    std::cout << "  server_ip            = " << config.server_ip << "\n";
-    std::cout << "  server_port          = " << config.server_port << "\n";
-    std::cout << "  compressed           = " << config.compressed << "\n";
-    std::cout << "  pcap_buffer_size_mb  = " << config.pcap_buffer_size_mb << "\n";
-    std::cout << "  batch_packet_count   = " << config.batch_packet_count << "\n";
-    std::cout << "  max_queue_blocks     = " << config.max_queue_blocks << "\n";
-    std::cout << "  send_buffer_size_kb  = " << config.send_buffer_size_kb << "\n";
-
-    return !config.interfaces.empty();
-}
-
-bool parse_filter_config(const std::string& filename, TrafficFilter& filter) {
-    std::ifstream filter_file(filename);
-    if (!filter_file.is_open()) {
-        std::cout << "Info: Filter file '" << filename << "' not found. Proceeding without traffic filter." << std::endl;
-        return false;
-    }
-
-    std::string line;
-    while (std::getline(filter_file, line)) {
-        line = trim(line);
-        if (line.empty() || line[0] == '#') continue;
-
-        std::stringstream ss(line);
-        std::string key, value;
-        if (std::getline(ss, key, '=')) {
-            std::getline(ss, value);
-            key = trim(key);
-            value = trim(value);
-
-            if (key == "ip_src") filter.ip_src = value;
-            else if (key == "ip_dst") filter.ip_dst = value;
-            else if (key == "port") filter.port = value;
-            else if (key == "protocol") filter.protocol = value;
-        }
-    }
-    return true;
-}
-
-std::string build_bpf_string(const TrafficFilter& filter) {
-    std::vector<std::string> parts;
-    if (!filter.ip_src.empty()) {
-        parts.push_back("src host " + filter.ip_src);
-    }
-    if (!filter.ip_dst.empty()) {
-        parts.push_back("dst host " + filter.ip_dst);
-    }
-    if (!filter.port.empty()) {
-        parts.push_back("port " + filter.port);
-    }
-    if (!filter.protocol.empty()) {
-        parts.push_back(filter.protocol);
-    }
-
-    if (parts.empty()) {
-        return ""; // Trả về chuỗi rỗng nếu không có quy tắc nào
-    }
-
-    std::string bpf_string = parts[0];
-    for (size_t i = 1; i < parts.size(); ++i) {
-        bpf_string += " and " + parts[i];
-    }
-    return bpf_string;
-}
-
-void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppConfig& config, BoundedThreadSafeQueue<PacketBlock>& queue) {
-    std::cout << "Capture thread for " << if_name << " started." << std::endl;
+void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppConfig& config,
+                         BoundedThreadSafeQueue<PacketBlock>& queue) {
     PacketBlock current_block;
     current_block.reserve(config.batch_packet_count);
-
-    size_t packets_pushed = 0;
-    size_t packets_received = 0;
-    size_t bytes_received = 0;
-
-    auto stats_start = std::chrono::steady_clock::now();
 
     while (!capture_interrupted) {
         pcap_pkthdr* header;
@@ -487,17 +98,16 @@ void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppCo
 
         if (ret == 1) {
             current_block.emplace_back(header, packet_data);
-            packets_received++;
-            bytes_received += header->caplen;
 
             if (current_block.size() >= static_cast<size_t>(config.batch_packet_count)) {
+                int sz = (int)current_block.size();
                 queue.push(std::move(current_block));
-                packets_pushed += config.batch_packet_count;
                 current_block.clear();
                 current_block.reserve(config.batch_packet_count);
             }
         } else if (ret == 0) {
             if (!current_block.empty()) {
+                int sz = (int)current_block.size();
                 queue.push(std::move(current_block));
                 current_block.clear();
                 current_block.reserve(config.batch_packet_count);
@@ -509,69 +119,20 @@ void capture_thread_func(pcap_t* handle, const std::string& if_name, const AppCo
             capture_interrupted = true;
             break;
         }
-
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration<double>(now - stats_start);
-        if (elapsed.count() >= 1.0) {
-            double mbps = (bytes_received * 8.0) / 1e6; // Megabit
-            std::cout << std::fixed << std::setprecision(2)
-                      << "Stats (" << if_name << ") [elapsed: " << elapsed.count() << "s]: "
-                      << "Packets received: " << packets_received
-                      << ", Pushed: " << packets_pushed
-                      << ", Traffic: " << mbps << " Mb/s" << std::endl;
-
-            packets_received = 0;
-            packets_pushed = 0;
-            bytes_received = 0;
-            stats_start = now;
-        }
     }
 
     if (!current_block.empty()) {
+        int sz = (int)current_block.size();
         queue.push(std::move(current_block));
     }
-
-    std::cout << "Capture thread for " << if_name << " finished." << std::endl;
 }
 
-
-struct SendLogEntry {
-    size_t packet_count;
-    size_t original_size;
-    size_t compressed_size;
-    std::chrono::steady_clock::time_point send_start_time;
-    std::chrono::steady_clock::time_point send_end_time;
-};
-std::vector<SendLogEntry> send_logs;
-std::mutex send_log_mutex;
-
-void save_send_logs_to_file(const std::string& filename) {
-    std::ofstream log_file(filename);
-    if (!log_file.is_open()) {
-        std::cerr << "Failed to open log file: " << filename << std::endl;
-        return;
-    }
-
-    log_file << "packet_count,original_size,compressed_size,send_duration_us\n";
-    for (const auto& entry : send_logs) {
-        auto duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(
-            entry.send_end_time - entry.send_start_time).count();
-
-        log_file << entry.packet_count << ","
-                 << entry.original_size << ","
-                 << entry.compressed_size << ","
-                 << duration_ms << "\n";
-    }
-
-    log_file.close();
-}
-
-void sender_thread_func(IConnection& connection, IDataProcessor& processor, const AppConfig& config, BoundedThreadSafeQueue<PacketBlock>& queue) {
+void sender_thread_func(IConnection& connection, IDataProcessor& processor, const AppConfig& config, BoundedThreadSafeQueue<PacketBlock>& queue, SendLogger& send_logger) {
     std::cout << "Sender thread started." << std::endl;
 
     PacketBlock block_to_send;
     std::vector<char> serialization_buffer;
-    std::vector<char> final_send_buffer; // Buffer cuối cùng để gửi đi
+    std::vector<char> final_send_buffer; 
     serialization_buffer.reserve(static_cast<size_t>(config.send_buffer_size_kb) * 1024);
 
     size_t total_bytes_sent_local = 0;
@@ -581,31 +142,41 @@ void sender_thread_func(IConnection& connection, IDataProcessor& processor, cons
     while (true) {
         if (!queue.pop(block_to_send)) break;
 
-        auto send_start_time = std::chrono::steady_clock::now();        
-        // 1. Serialize dữ liệu vào buffer như cũ
+        // === BẮT ĐẦU ĐO LƯỜNG CHO BLOCK HIỆN TẠI ===
+        // Thời điểm bắt đầu xử lý block (sau khi lấy từ queue)
+        auto block_processing_start_time = std::chrono::steady_clock::now();
+        
+        uint64_t total_waiting_time_us = 0;
+
+        // Serialize dữ liệu và tính toán thời gian chờ
         serialization_buffer.clear();
         for (const auto& packet : block_to_send) {
+            // Chuyển đổi pcap timestamp (system_clock) sang steady_clock để tính toán
+            auto packet_capture_time_point = std::chrono::system_clock::from_time_t(packet.header.ts.tv_sec)
+                                           + std::chrono::microseconds(packet.header.ts.tv_usec);
 
-        // ------------------ TEST LATENCY ------------------------
-            // Lấy thời gian hiện tại (theo epoch, micro giây)
-            std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
-            std::chrono::microseconds us_since_epoch = std::chrono::duration_cast<std::chrono::microseconds>(
-                now.time_since_epoch()
-            );
+            // Thời gian chờ = thời điểm bắt đầu xử lý (của cả block) - thời điểm packet được capture
+            // Lưu ý: Có thể ra số âm nếu đồng hồ hệ thống thay đổi. Dùng steady_clock cho block_processing_start_time để giảm thiểu vấn đề này.
+            // Để tính toán chính xác, ta nên so sánh system_clock với system_clock.
+            auto waiting_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now() - packet_capture_time_point);
+            
+            // Lấy thời điểm bắt đầu xử lý của block dưới dạng system_clock để tính toán
+            auto block_processing_start_system = std::chrono::system_clock::now();
+            auto waiting_time = std::chrono::duration_cast<std::chrono::microseconds>(
+                block_processing_start_system - packet_capture_time_point).count();
 
-            uint64_t send_ts_us = us_since_epoch.count();
+            total_waiting_time_us += (waiting_time > 0) ? waiting_time : 0;
 
-            // Nếu bạn vẫn cần ts_sec và ts_usec tách riêng như PCAP:
+            // ------------------ TEST LATENCY (Giữ nguyên logic của bạn) ------------------------
+            std::chrono::system_clock::time_point now_sys = std::chrono::system_clock::now();
+            uint64_t send_ts_us = std::chrono::duration_cast<std::chrono::microseconds>(now_sys.time_since_epoch()).count();
             uint32_t ts_sec = static_cast<uint32_t>(send_ts_us / 1000000);
             uint32_t ts_usec = static_cast<uint32_t>(send_ts_us % 1000000);
+            uint32_t ts_sec_net = htonl(ts_sec);    
+            uint32_t ts_usec_net = htonl(ts_usec);   
+            // -----------------------------------------------------------------------------------
 
-            uint32_t ts_sec_net = htonl(ts_sec);
-            uint32_t ts_usec_net = htonl(ts_usec);
-        // ----------------------------------------------
-
-
-            // uint32_t ts_sec_net = htonl(static_cast<uint32_t>(packet.header.ts.tv_sec));
-            // uint32_t ts_usec_net = htonl(static_cast<uint32_t>(packet.header.ts.tv_usec));
             uint32_t caplen_net = htonl(packet.header.caplen);
             uint32_t len_net = htonl(packet.header.len);
 
@@ -623,75 +194,85 @@ void sender_thread_func(IConnection& connection, IDataProcessor& processor, cons
             }
         }
 
-        if (!serialization_buffer.empty()) {
-            std::vector<char> processed_payload = processor.process(serialization_buffer);
-            if (processed_payload.empty() && config.compressed) {
-                std::cerr << "Compression failed, skipping block." << std::endl;
-                continue;
-            }
-
-            // 3. *** TẠO HEADER VÀ ĐÓNG GÓI BLOCK CUỐI CÙNG ***
-            uint8_t flags = 0;
-            if (config.compressed) {
-                flags |= FLAG_COMPRESSED_ZSTD;
-            }
-
-            uint32_t original_size = static_cast<uint32_t>(serialization_buffer.size());
-            uint32_t payload_size = static_cast<uint32_t>(processed_payload.size());
-
-            uint32_t original_size_net = htonl(original_size);
-            uint32_t payload_size_net = htonl(payload_size);
-
-            // Chuẩn bị buffer cuối cùng để gửi đi
-            final_send_buffer.clear();
-            final_send_buffer.resize(BLOCK_HEADER_SIZE + processed_payload.size());
-            
-            char* ptr = final_send_buffer.data();
-            
-            // Ghi header
-            memcpy(ptr, &flags, sizeof(flags));
-            ptr += sizeof(flags);
-            memcpy(ptr, &original_size_net, sizeof(original_size_net));
-            ptr += sizeof(original_size_net);
-            memcpy(ptr, &payload_size_net, sizeof(payload_size_net));
-            ptr += sizeof(payload_size_net);
-
-            // Ghi payload
-            memcpy(ptr, processed_payload.data(), processed_payload.size());
-
-
-            bool sent_success = connection.send_data(final_send_buffer.data(), final_send_buffer.size());
-            auto send_end_time = std::chrono::steady_clock::now();
-
-            if (!sent_success) {
-                std::cerr << "Failed to send data block to server. Stopping." << std::endl;
-                capture_interrupted = true;
-                queue.shutdown();
-                break;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(send_log_mutex);
-                send_logs.push_back(SendLogEntry{
-                    block_to_send.size(),
-                    original_size,
-                    payload_size,
-                    send_start_time,
-                    send_end_time
-                });
-            }            
-
-            total_bytes_sent_local += final_send_buffer.size();
-            total_packets_sent_local += block_to_send.size();
-
-            total_bytes_sent += serialization_buffer.size();
-            total_packets_sent += block_to_send.size();
+        if (serialization_buffer.empty()) {
+            continue;
         }
+
+        // <<< THÊM MỚI: Đo lường thời gian xử lý (nén)
+        auto processing_start_time = std::chrono::steady_clock::now();
+        std::vector<char> processed_payload = processor.process(serialization_buffer);
+        auto processing_end_time = std::chrono::steady_clock::now();
+
+        if (processed_payload.empty() && config.compressed) {
+            std::cerr << "Compression failed, skipping block." << std::endl;
+            continue;
+        }
+
+        uint8_t flags = 0;
+        if (config.compressed) {
+            flags |= FLAG_COMPRESSED_ZSTD;
+        }
+        uint32_t original_size = static_cast<uint32_t>(serialization_buffer.size());
+        uint32_t payload_size = static_cast<uint32_t>(processed_payload.size());
+        uint32_t original_size_net = htonl(original_size);
+        uint32_t payload_size_net = htonl(payload_size);
+
+        final_send_buffer.clear();
+        final_send_buffer.resize(BLOCK_HEADER_SIZE + payload_size);
+        char* ptr = final_send_buffer.data();
+        memcpy(ptr, &flags, sizeof(flags)); ptr += sizeof(flags);
+        memcpy(ptr, &original_size_net, sizeof(original_size_net)); ptr += sizeof(original_size_net);
+        memcpy(ptr, &payload_size_net, sizeof(payload_size_net)); ptr += sizeof(payload_size_net);
+        memcpy(ptr, processed_payload.data(), payload_size);
+
+        // Gửi dữ liệu và ghi nhận thời gian kết thúc
+        bool sent_success = connection.send_data(final_send_buffer.data(), final_send_buffer.size());
+        auto send_end_time = std::chrono::steady_clock::now(); // Thời điểm gửi xong
+
+        if (!sent_success) {
+            std::cerr << "Failed to send data block to server. Stopping." << std::endl;
+            capture_interrupted = true;
+            queue.shutdown();
+            break;
+        }
+
+        // === TÍNH TOÁN VÀ LƯU LOG ===
+        // Yêu cầu 1: Thời gian chờ trung bình
+        uint64_t avg_waiting_time_us = block_to_send.empty() ? 0 : total_waiting_time_us / block_to_send.size();
+        
+        // <<< THÊM MỚI: Tính toán thời gian xử lý/nén
+        auto proc_duration = std::chrono::duration_cast<std::chrono::microseconds>(processing_end_time - processing_start_time);
+        uint64_t processing_duration_us = proc_duration.count();
+
+        // Tính toán tổng thời gian xử lý đến khi gửi xong
+        auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(send_end_time - block_processing_start_time);
+        uint64_t processing_to_send_duration_us = total_duration.count();
+
+        // <<< MỚI: Tính toán avg_delay_per_packet_us
+        double avg_delay_per_packet_us = 1.0 * (avg_waiting_time_us + processing_to_send_duration_us) / block_to_send.size();
+
+        {
+            send_logger.add_entry(SendLogEntry{
+                block_to_send.size(),
+                original_size,
+                payload_size,
+                avg_waiting_time_us,
+                processing_duration_us,          // Giá trị mới   
+                processing_to_send_duration_us,             
+                avg_delay_per_packet_us
+            });
+        }            
+
+        // Cập nhật thống kê (không thay đổi)
+        total_bytes_sent_local += final_send_buffer.size();
+        total_packets_sent_local += block_to_send.size();
+        total_bytes_sent += serialization_buffer.size();
+        total_packets_sent += block_to_send.size();
 
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration<double>(now - stats_start);
         if (elapsed.count() >= 1.0) {
-            double mbps = (total_bytes_sent_local * 8.0) / 1e6; // megabits per second
+            double mbps = (total_bytes_sent_local * 8.0) / 1e6;
             std::cout << std::fixed << std::setprecision(2)
                       << "Sender stats [elapsed: " << elapsed.count() << "s]: "
                       << "Packets sent: " << total_packets_sent_local
@@ -708,26 +289,20 @@ void sender_thread_func(IConnection& connection, IDataProcessor& processor, cons
 }
 
 
-// --- Signal Handler ---
-void signal_handler(int signum) {
-    std::cout << "\nSignal " << signum << " received. Shutting down..." << std::endl;
-    capture_interrupted = true;
-    std::lock_guard<std::mutex> lock(global_handles_mutex);
-    for (pcap_t* handle : global_pcap_handles) {
-        if (handle) pcap_breakloop(handle);
-    }
-}
-
-
 int main() {
     AppConfig config;
+    TrafficFilter filter_config;
+
+    SendLogger send_logger;
+    BoundedThreadSafeQueue<PacketBlock> packet_queue(config.max_queue_blocks);
+
+
     if (!parse_config("config.txt", config)) {
         std::cerr << "Failed to parse config.txt or no interfaces specified. Exiting." << std::endl;
         return 1;
     }
 
     // --- ĐỌC CẤU HÌNH LỌC VÀ TẠO CHUỖI BPF ---
-    TrafficFilter filter_config;
     parse_filter_config("filter.txt", filter_config);
     std::string bpf_filter_string = build_bpf_string(filter_config);
 
@@ -735,7 +310,6 @@ int main() {
         std::cout << "Agent: Applying BPF filter: \"" << bpf_filter_string << "\"" << std::endl;
     }    
 
-    BoundedThreadSafeQueue<PacketBlock> packet_queue(config.max_queue_blocks);
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
@@ -746,7 +320,6 @@ int main() {
     int link_type = -1;
 
     for (size_t i = 0; i < config.interfaces.size(); ++i) {
-        // ... code khởi tạo pcap giữ nguyên ...
         const auto& if_name = config.interfaces[i];
         pcap_t* handle = pcap_create(if_name.c_str(), errbuf);
         if (!handle) { /* ... */ continue; }
@@ -789,6 +362,7 @@ int main() {
         
         { std::lock_guard<std::mutex> lock(global_handles_mutex); global_pcap_handles.push_back(handle); }
         interface_map[i] = if_name;
+
         capture_threads.emplace_back(capture_thread_func, handle, if_name, std::cref(config), std::ref(packet_queue));
     }
 
@@ -819,7 +393,7 @@ int main() {
     
     std::thread sender_t;
     if (!capture_interrupted) {
-        sender_t = std::thread(sender_thread_func, std::ref(*connection), std::ref(*processor), std::cref(config), std::ref(packet_queue));
+        sender_t = std::thread(sender_thread_func, std::ref(*connection), std::ref(*processor), std::cref(config), std::ref(packet_queue), std::ref(send_logger));
     }
     
     std::cout << "Main: Waiting for capture threads to finish..." << std::endl;
@@ -862,7 +436,7 @@ int main() {
         global_pcap_handles.clear();
     }    
 
-    save_send_logs_to_file("/home/maimanh/Downloads/Code/VDT/Project/test/agent/send_log.csv");
+    send_logger.save_to_file("/home/maimanh/Downloads/Code/VDT/Project/test/agent/send_log.csv");
     
     std::cout << "Agent: Exiting." << std::endl;
     return 0;
