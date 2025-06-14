@@ -47,10 +47,12 @@ bool parse_config(const std::string& filename, AppConfig& config) {
                     interface = trim(interface);
                     if (!interface.empty()) config.interfaces.push_back(interface);
                 }
-            } else if (key == "compressed") {
+            } else if (key == "compression") {
                 std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.compressed = (value == "true");
-            }
+                if (value == "zstd") config.compression = CompressionType::ZSTD;
+                else if (value == "zlib") config.compression = CompressionType::ZLIB;
+                else config.compression = CompressionType::NONE;
+            }        
         }
     }
 

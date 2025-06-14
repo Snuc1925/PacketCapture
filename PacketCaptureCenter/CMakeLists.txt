@@ -3,63 +3,82 @@ project(PacketCaptureCenter)
 
 set(CMAKE_CXX_STANDARD 17)
 
-# Tìm thư viện pcap (Linux)
+# === Tìm thư viện pcap ===
 find_library(PCAP_LIBRARY pcap)
 if(NOT PCAP_LIBRARY)
     message(FATAL_ERROR "libpcap not found. Install with: sudo apt-get install libpcap-dev")
 endif()
 
+# === Tìm thư viện UDT ===
 find_library(UDT_LIBRARY udt
   PATHS
     /usr/local/lib
     /usr/lib
-    ${CMAKE_SOURCE_DIR}/udt/lib # Ví dụ nếu bạn build UDT trong thư mục con 'udt'
-    # Thêm các đường dẫn tùy chỉnh khác nếu cần
+    ${CMAKE_SOURCE_DIR}/udt/lib
 )
 
 find_path(UDT_INCLUDE_DIR udt.h
   PATHS
     /usr/local/include
     /usr/include/udt
-    ${CMAKE_SOURCE_DIR}/udt/include # Ví dụ nếu bạn build UDT trong thư mục con 'udt'
-    # Thêm các đường dẫn tùy chỉnh khác nếu cần
+    ${CMAKE_SOURCE_DIR}/udt/include
 )
 
-# Kiểm tra xem UDT đã được tìm thấy cả thư viện và header chưa
 if(NOT UDT_LIBRARY OR NOT UDT_INCLUDE_DIR)
-    message(FATAL_ERROR "UDT not found. Ensure UDT library (libudt) and headers (udt.h) are installed or built correctly. Check expected lib/ and include/ paths.")
+    message(FATAL_ERROR "UDT not found.")
 endif()
 
-# Tìm thư viện Zstd
-find_library(ZSTD_LIBRARY zstd
-  PATHS /usr/lib /usr/local/lib
-)
+# === Tìm thư viện Zstd ===
+find_library(ZSTD_LIBRARY zstd PATHS /usr/lib /usr/local/lib)
+find_path(ZSTD_INCLUDE_DIR zstd.h PATHS /usr/include /usr/local/include)
 
-# Tìm header Zstd
-find_path(ZSTD_INCLUDE_DIR zstd.h
-  PATHS /usr/include /usr/local/include
-)
+if(NOT ZSTD_LIBRARY OR NOT ZSTD_INCLUDE_DIR)
+    message(FATAL_ERROR "Zstd not found. Install with: sudo apt install libzstd-dev")
+endif()
 
-
+# === Tìm OpenSSL & Threads ===
 find_package(OpenSSL REQUIRED)
-# Tìm threads
 find_package(Threads REQUIRED)
 
-add_executable(PacketCaptureCenter main.cpp)
+# === Tìm zlib =========
+find_package(ZLIB REQUIRED)
 
-# Link với pcap và threads cho Linux
-target_link_libraries(PacketCaptureCenter 
-    ${PCAP_LIBRARY} 
-    ${UDT_LIBRARY}  
-    ${ZSTD_LIBRARY}
-    Threads::Threads
-    OpenSSL::SSL          # Thư viện SSL của OpenSSL
-    OpenSSL::Crypto       # Thư viện Crypto của OpenSSL
+# === Danh sách source file ===
+set(SOURCE_FILES
+    main.cpp
+    src/connection/PlainTcpClient.cpp
+    src/connection/TlsClient.cpp
+    src/connection/net_utils.cpp
+    src/pcap/pcap_writer.cpp
+    src/pcap/LivePcapStreamer.cpp
+    src/logging/latency_logger.cpp
+    src/common/types.cpp
 )
 
-# Thêm include directories nếu cần
-target_include_directories(PacketCaptureCenter PRIVATE 
+# === Tạo executable ===
+add_executable(PacketCaptureCenter ${SOURCE_FILES})
+
+# === Include paths ===
+target_include_directories(PacketCaptureCenter PRIVATE
+    include
     ${UDT_INCLUDE_DIR}
     ${ZSTD_INCLUDE_DIR}
-    /usr/include/pcap
+    ${OpenSSL_INCLUDE_DIRS}
 )
+
+# === Link các thư viện ===
+target_link_libraries(PacketCaptureCenter
+    ${PCAP_LIBRARY}
+    ${UDT_LIBRARY}
+    ${ZSTD_LIBRARY}
+    ${ZLIB_LIBRARIES}
+    Threads::Threads
+    OpenSSL::SSL
+    OpenSSL::Crypto
+)
+
+# === In thông tin ra để debug ===
+message(STATUS "PCAP_LIBRARY: ${PCAP_LIBRARY}")
+message(STATUS "UDT_INCLUDE_DIR: ${UDT_INCLUDE_DIR}")
+message(STATUS "ZSTD_INCLUDE_DIR: ${ZSTD_INCLUDE_DIR}")
+message(STATUS "OpenSSL_INCLUDE_DIRS: ${OpenSSL_INCLUDE_DIRS}")
