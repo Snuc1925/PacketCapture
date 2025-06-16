@@ -15,6 +15,7 @@ struct SendLogEntry {
     uint64_t processing_duration_us;
     uint64_t processing_to_send_duration_us;
     double avg_delay_per_packet_us;
+    uint64_t send_timestamp_us; // <-- TRƯỜNG MỚI
 };
 
 class SendLogger {

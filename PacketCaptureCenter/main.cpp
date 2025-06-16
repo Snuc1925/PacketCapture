@@ -57,16 +57,18 @@ void save_latency_log_to_csv(const ClientState& client, const std::string& filen
         return;
     }
 
-    // Ghi dòng header
-    log_file << "payload_size,original_size,header_time_us,decompression_time_us,total_time_us\n";
+    // Ghi dòng header - THÊM CỘT MỚI
+    log_file << "block_id,payload_size,original_size,header_time_us,decompression_time_us,total_time_us,receive_timestamp_us\n";
 
     // Ghi dữ liệu của từng block
     for (const auto& entry : client.latency_log) {
-        log_file << entry.payload_size << ","
+        log_file << entry.block_id << ","
+                 << entry.payload_size << ","
                  << entry.original_size << ","
                  << entry.header_processing_time_us << ","
                  << entry.decompression_time_us << ","
-                 << entry.total_block_processing_time_us << "\n";
+                 << entry.total_block_processing_time_us << ","
+                 << entry.receive_timestamp_us << "\n"; // <-- GHI GIÁ TRỊ MỚI
     }
 
     log_file.close();
@@ -208,15 +210,15 @@ int main() {
                                     client.datalink_type = static_cast<int>(ntohl(link_type_net));
                                     client.recv_buffer.erase(client.recv_buffer.begin(), client.recv_buffer.begin() + AppConfig::METADATA_SIZE_LINKTYPE);
 
-                                    if (!streamer_initialized) {
-                                        if (live_streamer.open_stream(live_pipe_path, client.datalink_type)) {
-                                            streamer_initialized = true;
-                                            std::cout << "Live Stream: Successfully opened for real-time analysis." << std::endl;
-                                        } else {
-                                            std::cout << "Live Stream: Failed to open. Run Wireshark first: "
-                                                    << "'wireshark -k -i " << live_pipe_path << "'" << std::endl;
-                                        }
-                                    }                                    
+                                    // if (!streamer_initialized) {
+                                    //     if (live_streamer.open_stream(live_pipe_path, client.datalink_type)) {
+                                    //         streamer_initialized = true;
+                                    //         std::cout << "Live Stream: Successfully opened for real-time analysis." << std::endl;
+                                    //     } else {
+                                    //         std::cout << "Live Stream: Failed to open. Run Wireshark first: "
+                                    //                 << "'wireshark -k -i " << live_pipe_path << "'" << std::endl;
+                                    //     }
+                                    // }                                    
                                     
 
                                     // Chuyển sang trạng thái chờ block header
@@ -283,6 +285,19 @@ int main() {
                             
                             case ClientState::ReceiveFSM::AWAITING_BLOCK_PAYLOAD:
                                 if (client.recv_buffer.size() >= client.expected_payload_size) {
+                                    uint64_t block_receive_timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch()
+                                    ).count();
+
+                                    // Cập nhật timestamp vào bản ghi latency cuối cùng
+                                    if (!client.latency_log.empty()) {
+                                        client.latency_log.back().receive_timestamp_us = block_receive_timestamp_us;
+                                    } else {
+                                        // Trường hợp hiếm nhưng an toàn: log rỗng khi không nên
+                                        std::cerr << "Warning: Latency log empty when attempting to record receive_timestamp_us for fd " << client_fd << std::endl;
+                                    }
+
+
                                     const char* payload_start = client.recv_buffer.data();
                                     const char* data_to_process = nullptr;
                                     size_t data_to_process_size = 0;
@@ -347,9 +362,9 @@ int main() {
                                             pkt.header.len = ntohl(len_net);
                                             pkt.data.assign(reinterpret_cast<const unsigned char*>(packet_ptr), reinterpret_cast<const unsigned char*>(packet_ptr) + caplen);
 
-                                            if (live_streamer.is_open()) {
-                                                live_streamer.write_packet(&pkt.header, pkt.data.data());
-                                            }     
+                                            // if (live_streamer.is_open()) {
+                                            //     live_streamer.write_packet(&pkt.header, pkt.data.data());
+                                            // }     
                                             
 
                                             client.buffered_packets.push_back(std::move(pkt));
@@ -405,6 +420,6 @@ int main() {
     close(tcp_server_sock);
     close(tls_server_sock);
     std::cout << "Server shutdown complete." << std::endl;
-    live_streamer.close_stream();
+    // live_streamer.close_stream();
     return 0;
 }

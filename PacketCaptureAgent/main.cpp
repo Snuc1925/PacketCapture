@@ -236,6 +236,11 @@ void sender_thread_func(IConnection& connection, IDataProcessor& processor, cons
 
         // Gửi dữ liệu và ghi nhận thời gian kết thúc
         bool sent_success = connection.send_data(final_send_buffer.data(), final_send_buffer.size());
+
+        uint64_t current_send_timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();        
+
         // bool sent_success = true;
         auto send_end_time = std::chrono::steady_clock::now(); // Thời điểm gửi xong
 
@@ -269,7 +274,8 @@ void sender_thread_func(IConnection& connection, IDataProcessor& processor, cons
                 avg_waiting_time_us,
                 processing_duration_us,          // Giá trị mới   
                 processing_to_send_duration_us,             
-                avg_delay_per_packet_us
+                avg_delay_per_packet_us,
+                current_send_timestamp_us // <-- TRUYỀN GIÁ TRỊ TIMESTAMP MỚI VÀO ĐÂY                
             });
         }            
 

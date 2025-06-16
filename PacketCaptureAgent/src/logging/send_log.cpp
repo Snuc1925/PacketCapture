@@ -12,8 +12,9 @@ void SendLogger::save_to_file(const std::string& filename) {
         return;
     }
 
+    // Cập nhật dòng tiêu đề (header)
     log_file << "packet_count,original_size,compressed_size,avg_waiting_time_us,"
-                "processing_duration_us,processing_to_send_duration_us,avg_delay_per_packet_us\n";
+                "processing_duration_us,processing_to_send_duration_us,avg_delay_per_packet_us,send_timestamp_us\n"; // <-- THÊM TIÊU ĐỀ
 
     log_file << std::fixed << std::setprecision(3);
 
@@ -25,6 +26,8 @@ void SendLogger::save_to_file(const std::string& filename) {
                  << entry.avg_waiting_time_us << ","
                  << entry.processing_duration_us << ","
                  << entry.processing_to_send_duration_us << ","
-                 << entry.avg_delay_per_packet_us << "\n";
+                 << entry.avg_delay_per_packet_us << ","
+                 << entry.send_timestamp_us << "\n"; // <-- GHI GIÁ TRỊ MỚI
     }
+    std::cout << "Send logs saved to: " << filename << std::endl; // Thông báo khi lưu thành công
 }

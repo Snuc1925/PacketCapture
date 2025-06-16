@@ -19,6 +19,7 @@ struct LatencyInfo {
     long long header_processing_time_us = 0; // Thời gian xử lý header (micro giây)
     long long decompression_time_us = 0; // Thời gian giải nén (micro giây)
     long long total_block_processing_time_us = 0; // Tổng thời gian từ khi bắt đầu xử lý header đến khi xong payload
+    uint64_t receive_timestamp_us = 0; // <-- TRƯỜNG MỚI: Thời điểm nhận xong toàn bộ block (System clock)
 };
 
 struct ClientState {
