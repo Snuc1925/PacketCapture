@@ -9,7 +9,7 @@
 #include "decompressor/ZstdDecompressor.hpp"
 #include "decompressor/NoOpDecompressor.hpp"
 #include "decompressor/ZlibDecompressor.hpp"
-
+#include <chrono> // Đảm bảo đã include
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -34,6 +34,7 @@
 #include <openssl/err.h>
 #include <csignal> 
 #include <zstd.h> 
+#include <mutex>
 
 
 // ----------- Interupt -----------------
@@ -42,6 +43,37 @@ void signal_handler(int signum) {
     std::cout << "\nSignal " << signum << " received. Shutting down..." << std::endl;
     server_interrupted = true;
 }
+
+// Sử dụng mutex để đảm bảo việc ghi file từ nhiều luồng (nếu có sau này) là an toàn
+std::mutex csv_mutex; 
+
+void save_latency_log_to_csv(const ClientState& client, const std::string& filename) {
+    std::lock_guard<std::mutex> lock(csv_mutex);
+
+    // Mở file ở chế độ ghi mới (overwrite từ đầu)
+    std::ofstream log_file(filename, std::ios_base::out);
+    if (!log_file.is_open()) {
+        std::cerr << "Error: Could not open latency log file: " << filename << std::endl;
+        return;
+    }
+
+    // Ghi dòng header
+    log_file << "payload_size,original_size,header_time_us,decompression_time_us,total_time_us\n";
+
+    // Ghi dữ liệu của từng block
+    for (const auto& entry : client.latency_log) {
+        log_file << entry.payload_size << ","
+                 << entry.original_size << ","
+                 << entry.header_processing_time_us << ","
+                 << entry.decompression_time_us << ","
+                 << entry.total_block_processing_time_us << "\n";
+    }
+
+    log_file.close();
+    std::cout << "Server: Saved " << client.latency_log.size() 
+              << " latency records for client " << client.ip_address << ":" << client.port << std::endl;
+}
+
 
 
 int main() {
@@ -144,6 +176,12 @@ int main() {
                     if (!client.buffered_packets.empty()) {
                          save_packets_to_pcap(client);
                     }
+
+                    // --- GỌI HÀM LƯU LOG KHI DISCONNECT ---
+                    if (!client.latency_log.empty()) {
+                        save_latency_log_to_csv(client, "/home/maimanh/Downloads/Code/VDT/Project/test/agent/center_log.csv");
+                    }                    
+
                     std::cout << "Server: Received " 
                             << static_cast<double>(client.total_bytes) / (1024 * 1024) << " MB, "
                             << client.total_packets << " packets for client!!!" << std::endl;
@@ -192,6 +230,10 @@ int main() {
                             
                             case ClientState::ReceiveFSM::AWAITING_BLOCK_HEADER:
                                 if (client.recv_buffer.size() >= AppConfig::BLOCK_HEADER_SIZE) {
+                                    client.current_block_start_time = std::chrono::steady_clock::now();
+                                    auto header_start_time = std::chrono::steady_clock::now();
+
+
                                     const char* buf_ptr = client.recv_buffer.data();
 
                                     memcpy(&client.expected_flags, buf_ptr, sizeof(uint8_t));
@@ -219,8 +261,22 @@ int main() {
 
 
                                     client.recv_buffer.erase(client.recv_buffer.begin(), client.recv_buffer.begin() + AppConfig::BLOCK_HEADER_SIZE);
-                                    
                                     client.current_fsm_state = ClientState::ReceiveFSM::AWAITING_BLOCK_PAYLOAD;
+
+                                    // === KẾT THÚC ĐO THỜI GIAN XỬ LÝ HEADER ===
+                                    auto header_end_time = std::chrono::steady_clock::now();
+                                    long long header_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(header_end_time - header_start_time).count();
+                                    
+                                    // Tạo một bản ghi latency mới
+                                    LatencyInfo current_info;
+                                    current_info.block_id = client.latency_log.size();
+                                    current_info.header_processing_time_us = header_duration_us;
+                                    current_info.payload_size = client.expected_payload_size;
+                                    current_info.original_size = client.expected_original_size;
+
+                                    // Lưu tạm vào client state để cập nhật tiếp ở bước sau
+                                    client.latency_log.push_back(current_info); // Push vào luôn, sau đó sẽ cập nhật
+
                                     processed_data_in_this_pass = true;
                                 }
                                 break;
@@ -230,6 +286,9 @@ int main() {
                                     const char* payload_start = client.recv_buffer.data();
                                     const char* data_to_process = nullptr;
                                     size_t data_to_process_size = 0;
+
+                                    // === BẮT ĐẦU ĐO THỜI GIAN GIẢI NÉN ===
+                                    auto decompression_start_time = std::chrono::steady_clock::now();                                    
 
                                     bool decompression_successful = false; // Cờ để theo dõi việc giải nén có thành công không
 
@@ -247,6 +306,18 @@ int main() {
                                         std::cerr << "Decompression failed for socket " << client_fd << ". Discarding block." << std::endl;
                                         // decompression_successful vẫn là false
                                     }
+
+                                    // === KẾT THÚC ĐO THỜI GIAN GIẢI NÉN ===
+                                    auto decompression_end_time = std::chrono::steady_clock::now();
+                                    long long decompression_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(decompression_end_time - decompression_start_time).count();
+
+                                    // Cập nhật thông tin giải nén vào bản ghi latency cuối cùng
+                                    // Đảm bảo log không rỗng trước khi truy cập
+                                    if (!client.latency_log.empty()) {
+                                        client.latency_log.back().decompression_time_us = decompression_duration_us;
+                                    }
+                                    
+                                    
 
                                     // Chỉ xử lý dữ liệu nếu giải nén thành công (hoặc không cần giải nén)
                                     if (decompression_successful) {
@@ -280,21 +351,6 @@ int main() {
                                                 live_streamer.write_packet(&pkt.header, pkt.data.data());
                                             }     
                                             
-                                            uint32_t ts_sec = ntohl(ts_sec_net);
-                                            uint32_t ts_usec = ntohl(ts_usec_net);
-
-                                            // Phục hồi lại thời gian gửi (us)
-                                            uint64_t send_ts_us = static_cast<uint64_t>(ts_sec) * 1'000'000 + ts_usec;
-
-                                            auto now = std::chrono::system_clock::now();
-                                            uint64_t recv_ts_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
-
-                                            uint64_t latency_us = recv_ts_us - send_ts_us;
-                                            // std::cout << "Latency: " << latency_us << " us" << std::endl;
-
-                                            // Lưu vào vector
-                                            latency_log_entries.emplace_back(send_ts_us, recv_ts_us, latency_us);                                            
-                                            
 
                                             client.buffered_packets.push_back(std::move(pkt));
                                             client.current_total_bytes += caplen;
@@ -307,6 +363,15 @@ int main() {
                                     
                                     // Xóa payload đã xử lý khỏi buffer nhận
                                     client.recv_buffer.erase(client.recv_buffer.begin(), client.recv_buffer.begin() + client.expected_payload_size);
+
+                                    // === KẾT THÚC ĐO THỜI GIAN TOÀN BỘ BLOCK ===
+                                    auto block_end_time = std::chrono::steady_clock::now();
+                                    long long total_block_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(block_end_time - client.current_block_start_time).count();
+                                    
+                                    // Cập nhật thông tin tổng thời gian vào bản ghi latency cuối cùng
+                                    if (!client.latency_log.empty()) {
+                                        client.latency_log.back().total_block_processing_time_us = total_block_duration_us;
+                                    }                                    
 
 
                                     // Quay lại chờ header của block tiếp theo

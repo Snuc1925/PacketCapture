@@ -236,6 +236,7 @@ void sender_thread_func(IConnection& connection, IDataProcessor& processor, cons
 
         // Gửi dữ liệu và ghi nhận thời gian kết thúc
         bool sent_success = connection.send_data(final_send_buffer.data(), final_send_buffer.size());
+        // bool sent_success = true;
         auto send_end_time = std::chrono::steady_clock::now(); // Thời điểm gửi xong
 
         if (!sent_success) {
