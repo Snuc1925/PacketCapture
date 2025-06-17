@@ -35,7 +35,9 @@
 #include <csignal> 
 #include <zstd.h> 
 #include <mutex>
-
+#include <queue>
+#include <condition_variable>
+#include <thread>
 
 // ----------- Interupt -----------------
 std::atomic<bool> server_interrupted(false);
@@ -74,6 +76,66 @@ void save_latency_log_to_csv(const ClientState& client, const std::string& filen
               << " latency records for client " << client.ip_address << ":" << client.port << std::endl;
 }
 
+// Hàng đợi thread-safe để chứa các packet chờ được stream
+class PacketQueue {
+private:
+    std::queue<PacketInfo> queue_;
+    mutable std::mutex mutex_;
+    std::condition_variable cond_var_;
+    std::atomic<bool> stop_flag_{false};
+
+public:
+    // Đẩy một packet vào queue (sử dụng move semantics để hiệu quả)
+    void push(PacketInfo&& packet) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // Nếu luồng đã bị yêu cầu dừng, không nhận thêm packet nữa
+            if (stop_flag_) return;
+            queue_.push(std::move(packet));
+        }
+        cond_var_.notify_one();
+    }
+
+    // Lấy một packet ra khỏi queue. Trả về false nếu được yêu cầu dừng.
+    bool wait_and_pop(PacketInfo& packet) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cond_var_.wait(lock, [this] { return !queue_.empty() || stop_flag_; });
+
+        if (stop_flag_ && queue_.empty()) {
+            return false;
+        }
+
+        packet = std::move(queue_.front());
+        queue_.pop();
+        return true;
+    }
+
+    // Báo hiệu cho luồng consumer dừng lại
+    void shutdown() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_flag_ = true;
+        }
+        cond_var_.notify_all();
+    }
+};
+
+// Hàm thực thi của luồng streamer (Consumer)
+void streamer_worker(PacketQueue& queue, LivePcapStreamer& streamer) {
+    std::cout << "Streamer thread started." << std::endl;
+    PacketInfo packet_to_stream;
+
+    while (queue.wait_and_pop(packet_to_stream)) {
+        if (streamer.is_open()) {
+            streamer.write_packet(&packet_to_stream.header, packet_to_stream.data.data());
+        }
+        // Nếu streamer chưa mở, packet sẽ bị hủy.
+        // Đây là hành vi mong muốn để tránh block queue.
+    }
+
+    std::cout << "Streamer thread finished." << std::endl;
+}
+
 
 
 int main() {
@@ -100,7 +162,12 @@ int main() {
     int fd_max = std::max(tcp_server_sock, tls_server_sock);
     std::map<int, ClientState> clients_state;
 
+    // <<< THAY ĐỔI: KHỞI TẠO CÁC THÀNH PHẦN ĐA LUỒNG >>>
     LivePcapStreamer live_streamer;
+    PacketQueue packet_queue;
+    std::thread streamer_thread(streamer_worker, std::ref(packet_queue), std::ref(live_streamer));
+    // <<< KẾT THÚC THAY ĐỔI >>>
+
     const std::string live_pipe_path = "/tmp/live_stream.pcap";
     bool streamer_initialized = false;    
 
@@ -208,15 +275,16 @@ int main() {
                                     client.datalink_type = static_cast<int>(ntohl(link_type_net));
                                     client.recv_buffer.erase(client.recv_buffer.begin(), client.recv_buffer.begin() + AppConfig::METADATA_SIZE_LINKTYPE);
 
-                                    // if (!streamer_initialized) {
-                                    //     if (live_streamer.open_stream(live_pipe_path, client.datalink_type)) {
-                                    //         streamer_initialized = true;
-                                    //         std::cout << "Live Stream: Successfully opened for real-time analysis." << std::endl;
-                                    //     } else {
-                                    //         std::cout << "Live Stream: Failed to open. Run Wireshark first: "
-                                    //                 << "'wireshark -k -i " << live_pipe_path << "'" << std::endl;
-                                    //     }
-                                    // }                                    
+                                    // <<< THAY ĐỔI: Mở streamer từ luồng chính >>>
+                                    if (!streamer_initialized) {
+                                        if (live_streamer.open_stream(live_pipe_path, client.datalink_type)) {
+                                            streamer_initialized = true;
+                                            std::cout << "Live Stream: Successfully opened for real-time analysis." << std::endl;
+                                        } else {
+                                            std::cout << "Live Stream: Failed to open. Run Wireshark first: "
+                                                      << "'wireshark -k -i " << live_pipe_path << "'" << std::endl;
+                                        }
+                                    }                                
                                     
 
                                     // Chuyển sang trạng thái chờ block header
@@ -360,9 +428,14 @@ int main() {
                                             pkt.header.len = ntohl(len_net);
                                             pkt.data.assign(reinterpret_cast<const unsigned char*>(packet_ptr), reinterpret_cast<const unsigned char*>(packet_ptr) + caplen);
 
-                                            // if (live_streamer.is_open()) {
-                                            //     live_streamer.write_packet(&pkt.header, pkt.data.data());
-                                            // }     
+                                            // <<< THAY ĐỔI CHÍNH: ĐẨY PACKET VÀO QUEUE THAY VÌ GỌI TRỰC TIẾP >>>
+                                            if (streamer_initialized) {
+                                                // Tạo một bản sao của packet để đẩy vào queue,
+                                                // vì pkt gốc vẫn cần được move vào buffered_packets.
+                                                // Chúng ta sử dụng std::move cho hàng đợi, nhưng cần một đối tượng riêng.
+                                                PacketInfo pkt_for_stream = pkt; 
+                                                packet_queue.push(std::move(pkt_for_stream));
+                                            }
                                             
 
                                             client.buffered_packets.push_back(std::move(pkt));
@@ -407,6 +480,14 @@ int main() {
 
     // --- Shutdown (không đổi) ---
     std::cout << "Server shutting down. Saving remaining packets..." << std::endl;
+
+    packet_queue.shutdown();
+    if (streamer_thread.joinable()) {
+        streamer_thread.join();
+    }
+    live_streamer.close_stream(); // Đóng stream sau khi luồng đã dừng hẳn
+
+
     for (auto& pair : clients_state) {
         if (!pair.second.buffered_packets.empty()) {
             save_packets_to_pcap(pair.second);

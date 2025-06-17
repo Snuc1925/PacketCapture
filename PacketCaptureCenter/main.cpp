@@ -9,7 +9,7 @@
 #include "decompressor/ZstdDecompressor.hpp"
 #include "decompressor/NoOpDecompressor.hpp"
 #include "decompressor/ZlibDecompressor.hpp"
-#include <chrono> // Đảm bảo đã include
+#include <chrono> 
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -57,10 +57,8 @@ void save_latency_log_to_csv(const ClientState& client, const std::string& filen
         return;
     }
 
-    // Ghi dòng header - THÊM CỘT MỚI
     log_file << "block_id,payload_size,original_size,header_time_us,decompression_time_us,total_time_us,receive_timestamp_us\n";
 
-    // Ghi dữ liệu của từng block
     for (const auto& entry : client.latency_log) {
         log_file << entry.block_id << ","
                  << entry.payload_size << ","
@@ -210,15 +208,15 @@ int main() {
                                     client.datalink_type = static_cast<int>(ntohl(link_type_net));
                                     client.recv_buffer.erase(client.recv_buffer.begin(), client.recv_buffer.begin() + AppConfig::METADATA_SIZE_LINKTYPE);
 
-                                    // if (!streamer_initialized) {
-                                    //     if (live_streamer.open_stream(live_pipe_path, client.datalink_type)) {
-                                    //         streamer_initialized = true;
-                                    //         std::cout << "Live Stream: Successfully opened for real-time analysis." << std::endl;
-                                    //     } else {
-                                    //         std::cout << "Live Stream: Failed to open. Run Wireshark first: "
-                                    //                 << "'wireshark -k -i " << live_pipe_path << "'" << std::endl;
-                                    //     }
-                                    // }                                    
+                                    if (!streamer_initialized) {
+                                        if (live_streamer.open_stream(live_pipe_path, client.datalink_type)) {
+                                            streamer_initialized = true;
+                                            std::cout << "Live Stream: Successfully opened for real-time analysis." << std::endl;
+                                        } else {
+                                            std::cout << "Live Stream: Failed to open. Run Wireshark first: "
+                                                    << "'wireshark -k -i " << live_pipe_path << "'" << std::endl;
+                                        }
+                                    }                                    
                                     
 
                                     // Chuyển sang trạng thái chờ block header
@@ -362,9 +360,9 @@ int main() {
                                             pkt.header.len = ntohl(len_net);
                                             pkt.data.assign(reinterpret_cast<const unsigned char*>(packet_ptr), reinterpret_cast<const unsigned char*>(packet_ptr) + caplen);
 
-                                            // if (live_streamer.is_open()) {
-                                            //     live_streamer.write_packet(&pkt.header, pkt.data.data());
-                                            // }     
+                                            if (live_streamer.is_open()) {
+                                                live_streamer.write_packet(&pkt.header, pkt.data.data());
+                                            }     
                                             
 
                                             client.buffered_packets.push_back(std::move(pkt));

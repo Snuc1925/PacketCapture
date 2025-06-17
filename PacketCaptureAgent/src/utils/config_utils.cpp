@@ -60,11 +60,7 @@ bool parse_config(const std::string& filename, AppConfig& config) {
     std::cout << "  server_ip            = " << config.server_ip << "\n";
     std::cout << "  server_port          = " << config.server_port << "\n";
     std::cout << "  compressed           = " << config.compressed << "\n";
-    std::cout << "  pcap_buffer_size_mb  = " << config.pcap_buffer_size_mb << "\n";
     std::cout << "  batch_packet_count   = " << config.batch_packet_count << "\n";
-    std::cout << "  max_queue_blocks     = " << config.max_queue_blocks << "\n";
-    std::cout << "  send_buffer_size_kb  = " << config.send_buffer_size_kb << "\n";
-
     return !config.interfaces.empty();
 }
 
