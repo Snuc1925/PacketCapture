@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+# Đảm bảo Systemd nạp lại cấu hình dịch vụ
+systemctl daemon-reload || true
+
+# Kích hoạt và khởi động dịch vụ
+systemctl enable packetcaptureagent || true
+systemctl start packetcaptureagent || true
+
+exit 0

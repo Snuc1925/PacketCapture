@@ -1,0 +1,13 @@
+[Unit]
+Description=Packet Capture Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/PacketCaptureAgent --config /etc/packetcaptureagent/config.json # Điều chỉnh đường dẫn và đối số nếu cần
+Restart=on-failure
+User=root # Hoặc một user không có quyền root nếu ứng dụng không yêu cầu
+Group=root
+
+[Install]
+WantedBy=multi-user.target
